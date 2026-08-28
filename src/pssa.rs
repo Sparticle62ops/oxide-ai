@@ -1,5 +1,5 @@
 use crate::adapter::PlasticAdapterV2;
-use crate::backend::{Device, WgpuContext};
+use crate::backend::Device;
 use crate::linalg::{dot_slice, sigmoid, softplus, SimpleRng};
 use crate::memory::HyperbolicEpisodicBankV2;
 use std::f32;
@@ -49,6 +49,7 @@ impl ParamVector {
             self.data[i] -= lr * m_hat / (v_hat.sqrt() + eps);
         }
     }
+
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -117,6 +118,28 @@ impl ParamMatrix {
             for c in 0..self.cols {
                 out[c] += gr * self.data[row_off + c];
             }
+        }
+    }
+
+    pub fn step_adamw_row(&mut self, row: usize, lr: f32, beta1: f32, beta2: f32, weight_decay: f32, eps: f32, step: usize) {
+        assert!(row < self.rows);
+        let step_f = step as f32;
+        let bias_corr1 = 1.0 - beta1.powf(step_f);
+        let bias_corr2 = 1.0 - beta2.powf(step_f);
+        let row_start = row * self.cols;
+        let row_end = row_start + self.cols;
+
+        for i in row_start..row_end {
+            let g = self.grad[i];
+            if weight_decay > 0.0 {
+                self.data[i] -= lr * weight_decay * self.data[i];
+            }
+            self.m[i] = beta1 * self.m[i] + (1.0 - beta1) * g;
+            self.v[i] = beta2 * self.v[i] + (1.0 - beta2) * g * g;
+
+            let m_hat = self.m[i] / bias_corr1;
+            let v_hat = self.v[i] / bias_corr2;
+            self.data[i] -= lr * m_hat / (v_hat.sqrt() + eps);
         }
     }
 
@@ -192,6 +215,7 @@ pub struct ChunkActivationTape {
     pub target_ids: Vec<usize>,
     pub x_norm: Vec<f32>,
     pub inv_rms: Vec<f32>,
+    pub delta_raw: Vec<f32>,
     pub delta: Vec<f32>,
     pub b_proj: Vec<f32>,
     pub c_proj: Vec<f32>,
@@ -206,6 +230,8 @@ pub struct ChunkActivationTape {
     pub m_val: Vec<f32>,
     pub g_mem: Vec<f32>,
     pub m_inj: Vec<f32>,
+    pub m_proj: Vec<f32>,
+    pub adapter_hidden: Vec<f32>,
     pub adapter_act: Vec<f32>,
     pub z_raw: Vec<f32>,
     pub mlp_hidden: Vec<f32>,
@@ -224,6 +250,7 @@ impl ChunkActivationTape {
             target_ids: vec![0; max_l],
             x_norm: vec![0.0; max_l * d_latent],
             inv_rms: vec![0.0; max_l],
+            delta_raw: vec![0.0; max_l * d_latent],
             delta: vec![0.0; max_l * d_latent],
             b_proj: vec![0.0; max_l * d_state],
             c_proj: vec![0.0; max_l * d_state],
@@ -238,6 +265,8 @@ impl ChunkActivationTape {
             m_val: vec![0.0; max_l * d_latent],
             g_mem: vec![0.0; max_l * d_latent],
             m_inj: vec![0.0; max_l * d_latent],
+            m_proj: vec![0.0; max_l * d_latent],
+            adapter_hidden: vec![0.0; max_l * rank],
             adapter_act: vec![0.0; max_l * rank],
             z_raw: vec![0.0; max_l * d_latent],
             mlp_hidden: vec![0.0; max_l * 2 * d_latent],
@@ -297,6 +326,20 @@ pub struct PSSALayerV2 {
     pub grad_z_final: Vec<f32>,
     pub grad_z_raw: Vec<f32>,
     pub grad_x_norm: Vec<f32>,
+    pub embed_row_marks: Vec<usize>,
+    pub buf_m_proj: Vec<f32>,
+    pub buf_ad_out: Vec<f32>,
+    pub buf_g_mlp_act: Vec<f32>,
+    pub buf_g_mlp_hidden: Vec<f32>,
+    pub buf_g_zraw_mlp: Vec<f32>,
+    pub buf_g_ad_act: Vec<f32>,
+    pub buf_g_ad_down: Vec<f32>,
+    pub buf_g_m_proj_out: Vec<f32>,
+    pub buf_g_m_val: Vec<f32>,
+    pub buf_g_delta: Vec<f32>,
+    pub buf_g_b_proj: Vec<f32>,
+    pub buf_g_c_proj: Vec<f32>,
+    pub buf_g_h_prev: Vec<f32>,
 
     // Inference Scratch Buffers
     pub inf_x_norm: Vec<f32>,
@@ -397,6 +440,20 @@ impl PSSALayerV2 {
             grad_z_final: vec![0.0; d_m],
             grad_z_raw: vec![0.0; d_m],
             grad_x_norm: vec![0.0; d_m],
+            embed_row_marks: vec![0; d_v],
+            buf_m_proj: vec![0.0; d_m],
+            buf_ad_out: vec![0.0; d_m],
+            buf_g_mlp_act: vec![0.0; d_mlp],
+            buf_g_mlp_hidden: vec![0.0; d_mlp],
+            buf_g_zraw_mlp: vec![0.0; d_m],
+            buf_g_ad_act: vec![0.0; rank],
+            buf_g_ad_down: vec![0.0; rank],
+            buf_g_m_proj_out: vec![0.0; d_m],
+            buf_g_m_val: vec![0.0; d_m],
+            buf_g_delta: vec![0.0; d_m],
+            buf_g_b_proj: vec![0.0; d_s],
+            buf_g_c_proj: vec![0.0; d_s],
+            buf_g_h_prev: vec![0.0; d_m * d_s],
             inf_x_norm: vec![0.0; d_m],
             inf_delta: vec![0.0; d_m],
             inf_b: vec![0.0; d_s],
@@ -431,6 +488,8 @@ impl PSSALayerV2 {
         let d_k = self.cfg.d_mem_key;
         let d_mlp = d_m * 2;
         let rank = self.adapters[0].rank;
+        let ssm_scale = 1.0 / (d_s as f32).sqrt();
+        let logit_scale = 1.0 / (d_m as f32).sqrt();
 
         // 1. Embedding & Affine RMSNorm
         let e_t = &self.embed_w.data[x_id * d_m..(x_id + 1) * d_m];
@@ -501,7 +560,9 @@ impl PSSALayerV2 {
 
         // 6. Latent Aggregation & SiLU MLP Expansion
         for i in 0..d_m {
-            self.inf_z_raw[i] = self.inf_y_ssm[i] + (self.inf_g_mem[i] * self.inf_m_proj[i]) + self.inf_ad_out[i];
+            self.inf_z_raw[i] = (self.inf_y_ssm[i] * ssm_scale)
+                + (self.inf_g_mem[i] * self.inf_m_proj[i])
+                + self.inf_ad_out[i];
         }
 
         self.mlp_w1.matvec(&self.inf_z_raw, &mut self.inf_mlp_act[..d_mlp]);
@@ -517,6 +578,9 @@ impl PSSALayerV2 {
 
         // 7. Output Vocabulary Logits
         self.unembed_w.matvec(&self.inf_z_final, logits_out);
+        for logit in logits_out.iter_mut() {
+            *logit *= logit_scale;
+        }
     }
 
     // =========================================================================
@@ -531,6 +595,8 @@ impl PSSALayerV2 {
         let d_mlp = d_m * 2;
         let mem_cap = self.cfg.mem_capacity;
         let rank = self.adapters[0].rank;
+        let ssm_scale = 1.0 / (d_s as f32).sqrt();
+        let logit_scale = 1.0 / (d_m as f32).sqrt();
 
         self.tape.x_ids[..seq_len].copy_from_slice(&token_ids[..seq_len]);
         self.tape.target_ids[..seq_len].copy_from_slice(&target_ids[..seq_len]);
@@ -556,9 +622,9 @@ impl PSSALayerV2 {
 
             // 2. Data-Dependent Projections
             let del_off = t * d_m;
-            self.w_delta.matvec(x_n, &mut self.tape.delta[del_off..del_off + d_m]);
+            self.w_delta.matvec(x_n, &mut self.tape.delta_raw[del_off..del_off + d_m]);
             for i in 0..d_m {
-                self.tape.delta[del_off + i] = softplus(self.tape.delta[del_off + i]);
+                self.tape.delta[del_off + i] = softplus(self.tape.delta_raw[del_off + i]);
             }
             let delta = &self.tape.delta[del_off..del_off + d_m];
 
@@ -623,26 +689,27 @@ impl PSSALayerV2 {
                 self.tape.g_mem[m_off + i] = sigmoid(self.tape.g_mem[m_off + i]);
             }
 
-            let mut m_proj_out = vec![0.0; d_m];
-            self.w_proj.matvec(&self.tape.m_val[m_off..m_off + d_m], &mut m_proj_out);
+            self.w_proj.matvec(&self.tape.m_val[m_off..m_off + d_m], &mut self.buf_m_proj);
             for i in 0..d_m {
-                self.tape.m_inj[m_off + i] = self.tape.g_mem[m_off + i] * m_proj_out[i];
+                self.tape.m_proj[m_off + i] = self.buf_m_proj[i];
+                self.tape.m_inj[m_off + i] = self.tape.g_mem[m_off + i] * self.buf_m_proj[i];
             }
 
             // 5. Zero-Init Plastic Adapter
             let ad_off = t * rank;
-            self.adapters[0].down_proj.matvec(x_n, &mut self.tape.adapter_act[ad_off..ad_off + rank]);
+            self.adapters[0].down_proj.matvec(x_n, &mut self.tape.adapter_hidden[ad_off..ad_off + rank]);
             for r in 0..rank {
-                let h = self.tape.adapter_act[ad_off + r];
+                let h = self.tape.adapter_hidden[ad_off + r];
                 self.tape.adapter_act[ad_off + r] = h * sigmoid(h);
             }
-            let mut ad_out = vec![0.0; d_m];
-            self.adapters[0].up_proj.matvec(&self.tape.adapter_act[ad_off..ad_off + rank], &mut ad_out);
+            self.adapters[0].up_proj.matvec(&self.tape.adapter_act[ad_off..ad_off + rank], &mut self.buf_ad_out);
 
             // 6. Latent Aggregation & SiLU MLP Expansion
             let z_off = t * d_m;
             for i in 0..d_m {
-                self.tape.z_raw[z_off + i] = y_ssm[i] + self.tape.m_inj[m_off + i] + ad_out[i];
+                self.tape.z_raw[z_off + i] = (y_ssm[i] * ssm_scale)
+                    + self.tape.m_inj[m_off + i]
+                    + self.buf_ad_out[i];
             }
             let z_raw = &self.tape.z_raw[z_off..z_off + d_m];
 
@@ -661,6 +728,9 @@ impl PSSALayerV2 {
             // 7. Output Vocabulary Logits & Softmax Loss
             let log_off = t * d_v;
             self.unembed_w.matvec(z_final, &mut self.tape.logits[log_off..log_off + d_v]);
+            for i in 0..d_v {
+                self.tape.logits[log_off + i] *= logit_scale;
+            }
 
             let mut max_l = f32::NEG_INFINITY;
             for i in 0..d_v {
@@ -695,14 +765,7 @@ impl PSSALayerV2 {
     // =========================================================================
     // 3. EXACT TBPTT BACKWARD PASS & ADAMW OPTIMIZATION
     // =========================================================================
-    pub fn backward_and_step_chunk(&mut self, seq_len: usize) {
-        let d_m = self.cfg.d_latent;
-        let d_s = self.cfg.d_state;
-        let d_v = self.cfg.d_vocab;
-        let d_mlp = d_m * 2;
-        let rank = self.adapters[0].rank;
-        let scale_loss = 1.0 / (seq_len as f32);
-
+    pub fn zero_gradients(&mut self) {
         self.embed_w.zero_grad();
         self.norm_gamma.zero_grad();
         self.norm_beta.zero_grad();
@@ -718,6 +781,22 @@ impl PSSALayerV2 {
         self.mlp_w1.zero_grad();
         self.mlp_w2.zero_grad();
         self.unembed_w.zero_grad();
+    }
+
+    pub fn backward_chunk(&mut self, seq_len: usize, accumulation_scale: f32) {
+        let d_m = self.cfg.d_latent;
+        let d_s = self.cfg.d_state;
+        let d_v = self.cfg.d_vocab;
+        let d_mlp = d_m * 2;
+        let rank = self.adapters[0].rank;
+        let scale_loss = accumulation_scale / (seq_len as f32);
+        let ssm_scale = 1.0 / (d_s as f32).sqrt();
+        let logit_scale = 1.0 / (d_m as f32).sqrt();
+
+        let pending_step = self.step_counter + 1;
+        for t in 0..seq_len {
+            self.embed_row_marks[self.tape.x_ids[t]] = pending_step;
+        }
 
         self.grad_h_next.fill(0.0);
 
@@ -741,7 +820,7 @@ impl PSSALayerV2 {
                 }
 
                 let indicator = if is_target { 1.0 } else { 0.0 };
-                let g_logit = (prob - indicator) * scale_loss;
+                let g_logit = (prob - indicator) * scale_loss * logit_scale;
 
                 let row_off = i * d_m;
                 
@@ -769,8 +848,7 @@ impl PSSALayerV2 {
 
             // 2. SiLU MLP Backward
             let mlp_off = t * d_mlp;
-            let mut g_mlp_act = vec![0.0; d_mlp];
-            self.mlp_w2.matvec_transpose(&self.grad_z_final, &mut g_mlp_act);
+            self.mlp_w2.matvec_transpose(&self.grad_z_final, &mut self.buf_g_mlp_act);
 
             for i in 0..d_m {
                 let gz_i = self.grad_z_final[i];
@@ -787,19 +865,17 @@ impl PSSALayerV2 {
                 }
             }
 
-            let mut g_mlp_hidden = vec![0.0; d_mlp];
             for i in 0..d_mlp {
                 let h = self.tape.mlp_hidden[mlp_off + i];
                 let sig_h = sigmoid(h);
                 let silu_prime = sig_h * (1.0 + h * (1.0 - sig_h));
-                g_mlp_hidden[i] = g_mlp_act[i] * silu_prime;
+                self.buf_g_mlp_hidden[i] = self.buf_g_mlp_act[i] * silu_prime;
             }
 
-            let mut g_zraw_from_mlp = vec![0.0; d_m];
-            self.mlp_w1.matvec_transpose(&g_mlp_hidden, &mut g_zraw_from_mlp);
+            self.mlp_w1.matvec_transpose(&self.buf_g_mlp_hidden, &mut self.buf_g_zraw_mlp);
 
             for i in 0..d_mlp {
-                let gh_i = g_mlp_hidden[i];
+                let gh_i = self.buf_g_mlp_hidden[i];
                 let row_off = i * d_m;
                 for j in (0..d_m).step_by(8) {
                     self.mlp_w1.grad[row_off + j] += gh_i * self.tape.z_raw[z_off + j];
@@ -814,13 +890,12 @@ impl PSSALayerV2 {
             }
 
             for i in 0..d_m {
-                self.grad_z_raw[i] = self.grad_z_final[i] + g_zraw_from_mlp[i];
+                self.grad_z_raw[i] = self.grad_z_final[i] + self.buf_g_zraw_mlp[i];
             }
 
             // 3. Adapter Backward
             let ad_off = t * rank;
-            let mut g_ad_act = vec![0.0; rank];
-            self.adapters[0].up_proj.matvec_transpose(&self.grad_z_raw, &mut g_ad_act);
+            self.adapters[0].up_proj.matvec_transpose(&self.grad_z_raw, &mut self.buf_g_ad_act);
 
             for i in 0..d_m {
                 let gz_i = self.grad_z_raw[i];
@@ -830,17 +905,16 @@ impl PSSALayerV2 {
                 }
             }
 
-            let mut g_ad_down = vec![0.0; rank];
             for r in 0..rank {
-                let h = self.tape.adapter_act[ad_off + r];
+                let h = self.tape.adapter_hidden[ad_off + r];
                 let sig_h = sigmoid(h);
                 let silu_prime = sig_h * (1.0 + h * (1.0 - sig_h));
-                g_ad_down[r] = g_ad_act[r] * silu_prime;
+                self.buf_g_ad_down[r] = self.buf_g_ad_act[r] * silu_prime;
             }
 
             self.grad_x_norm.fill(0.0);
             for r in 0..rank {
-                let gad_r = g_ad_down[r];
+                let gad_r = self.buf_g_ad_down[r];
                 let row_off = r * d_m;
                 for j in 0..d_m {
                     self.grad_x_norm[j] += gad_r * self.adapters[0].down_proj.data[row_off + j];
@@ -850,14 +924,13 @@ impl PSSALayerV2 {
 
             // 4. Memory Injection Backward
             let m_off = t * d_m;
-            let mut g_m_proj_out = vec![0.0; d_m];
             for i in 0..d_m {
                 let gz_i = self.grad_z_raw[i];
                 let g_mem = self.tape.g_mem[m_off + i];
-                g_m_proj_out[i] = gz_i * g_mem;
+                self.buf_g_m_proj_out[i] = gz_i * g_mem;
 
                 let d_sig = g_mem * (1.0 - g_mem);
-                let g_wgate_pre = gz_i * self.tape.m_val[m_off + i] * d_sig;
+                let g_wgate_pre = gz_i * self.tape.m_proj[m_off + i] * d_sig;
                 let row_off = i * d_m;
                 for j in 0..d_m {
                     self.grad_x_norm[j] += g_wgate_pre * self.w_gate.data[row_off + j];
@@ -865,10 +938,9 @@ impl PSSALayerV2 {
                 }
             }
 
-            let mut g_m_val = vec![0.0; d_m];
-            self.w_proj.matvec_transpose(&g_m_proj_out, &mut g_m_val);
+            self.w_proj.matvec_transpose(&self.buf_g_m_proj_out, &mut self.buf_g_m_val);
             for i in 0..d_m {
-                let g_mp_i = g_m_proj_out[i];
+                let g_mp_i = self.buf_g_m_proj_out[i];
                 let row_off = i * d_m;
                 for j in 0..d_m {
                     self.w_proj.grad[row_off + j] += g_mp_i * self.tape.m_val[m_off + j];
@@ -876,20 +948,20 @@ impl PSSALayerV2 {
             }
 
             // 5. Multi-Channel SSM Recurrence Backward & Temporal State Flow
-            let y_off = t * d_m;
             let ssm_off = t * (d_m * d_s);
             let h_prev_off = t * (d_m * d_s);
             let c_off = t * d_s;
             let b_off = t * d_s;
             let del_off = t * d_m;
 
-            let mut g_delta = vec![0.0; d_m];
-            let mut g_b_proj = vec![0.0; d_s];
-            let mut g_c_proj = vec![0.0; d_s];
-            let mut g_h_prev = vec![0.0; d_m * d_s];
+            self.buf_g_delta.fill(0.0);
+            self.buf_g_b_proj.fill(0.0);
+            self.buf_g_c_proj.fill(0.0);
+            self.buf_g_h_prev.fill(0.0);
 
             for i in 0..d_m {
                 let gz_i = self.grad_z_raw[i];
+                let g_y_i = gz_i * ssm_scale;
                 let d_i = self.tape.delta[del_off + i];
                 let xn_i = self.tape.x_norm[t * d_m + i];
 
@@ -901,23 +973,23 @@ impl PSSALayerV2 {
                     let a_orig = self.a_mat.data[idx];
                     let b_val = self.tape.b_proj[b_off + j];
 
-                    let g_h_total = gz_i * c_val + self.grad_h_next[idx];
+                    let g_h_total = g_y_i * c_val + self.grad_h_next[idx];
 
-                    g_c_proj[j] += gz_i * h_next;
-                    g_h_prev[idx] += g_h_total * bar_a;
+                    self.buf_g_c_proj[j] += g_y_i * h_next;
+                    self.buf_g_h_prev[idx] += g_h_total * bar_a;
 
                     self.a_mat.grad[idx] += g_h_total * (d_i * bar_a) * self.tape.h_states[h_prev_off + idx];
-                    g_delta[i] += g_h_total * (a_orig * bar_a * self.tape.h_states[h_prev_off + idx] + b_val * xn_i);
-                    g_b_proj[j] += g_h_total * (d_i * xn_i);
+                    self.buf_g_delta[i] += g_h_total * (a_orig * bar_a * self.tape.h_states[h_prev_off + idx] + b_val * xn_i);
+                    self.buf_g_b_proj[j] += g_h_total * (d_i * xn_i);
                     self.grad_x_norm[i] += g_h_total * self.tape.bar_b[ssm_off + idx];
                 }
             }
 
-            self.grad_h_next.copy_from_slice(&g_h_prev);
+            self.grad_h_next.copy_from_slice(&self.buf_g_h_prev);
 
             for i in 0..d_m {
-                let d_sig = sigmoid(self.tape.delta[del_off + i]);
-                let gd_i = g_delta[i] * d_sig;
+                let d_sig = sigmoid(self.tape.delta_raw[del_off + i]);
+                let gd_i = self.buf_g_delta[i] * d_sig;
                 let row_off = i * d_m;
                 for j in 0..d_m {
                     self.grad_x_norm[j] += gd_i * self.w_delta.data[row_off + j];
@@ -926,8 +998,8 @@ impl PSSALayerV2 {
             }
 
             for j in 0..d_s {
-                let gb_j = g_b_proj[j];
-                let gc_j = g_c_proj[j];
+                let gb_j = self.buf_g_b_proj[j];
+                let gc_j = self.buf_g_c_proj[j];
                 let row_off = j * d_m;
                 for k in 0..d_m {
                     self.grad_x_norm[k] += gb_j * self.w_b.data[row_off + k] + gc_j * self.w_c.data[row_off + k];
@@ -958,18 +1030,21 @@ impl PSSALayerV2 {
             }
         }
 
-        // =====================================================================
-        // APPLY ADAMW PARAMETER UPDATES ACROSS ALL SUBSYSTEMS
-        // =====================================================================
+    }
+
+    pub fn apply_adamw(&mut self, lr: f32) {
         self.step_counter += 1;
-        let lr = self.cfg.lr;
         let beta1 = self.cfg.beta1;
         let beta2 = self.cfg.beta2;
         let wd = self.cfg.weight_decay;
         let eps = self.cfg.eps;
         let step = self.step_counter;
 
-        self.embed_w.step_adamw(lr, beta1, beta2, wd, eps, step);
+        for row in 0..self.embed_w.rows {
+            if self.embed_row_marks[row] == step {
+                self.embed_w.step_adamw_row(row, lr, beta1, beta2, wd, eps, step);
+            }
+        }
         self.norm_gamma.step_adamw(lr, beta1, beta2, 0.0, eps, step);
         self.norm_beta.step_adamw(lr, beta1, beta2, 0.0, eps, step);
         self.a_mat.step_adamw(lr, beta1, beta2, wd, eps, step);
@@ -986,6 +1061,12 @@ impl PSSALayerV2 {
         self.unembed_w.step_adamw(lr, beta1, beta2, wd, eps, step);
     }
 
+    pub fn backward_and_step_chunk(&mut self, seq_len: usize) {
+        self.zero_gradients();
+        self.backward_chunk(seq_len, 1.0);
+        self.apply_adamw(self.cfg.lr);
+    }
+
     // =========================================================================
     // 4. EMA CONSOLIDATION (THE SLEEP PHASE)
     // =========================================================================
@@ -994,15 +1075,19 @@ impl PSSALayerV2 {
         let d_m = self.cfg.d_latent;
         let rank = self.adapters[0].rank;
 
-        for r in 0..rank {
-            let ad_down_row = &self.adapters[0].down_proj.data[r * d_m..(r + 1) * d_m];
-            for i in 0..d_m {
-                let ad_up_val = self.adapters[0].up_proj.data[i * rank + r];
-                if ad_up_val.abs() > 1e-6 {
-                    let base_idx = i * d_m + r;
-                    if base_idx < self.mlp_w1.data.len() {
-                        self.mlp_w1.data[base_idx] = (1.0 - alpha) * self.mlp_w1.data[base_idx] + alpha * (ad_up_val * ad_down_row[r]);
-                    }
+        // Merge the adapter's low-rank linear product into the latent-width
+        // portion of the MLP input projection.
+        for i in 0..self.mlp_w1.rows.min(d_m) {
+            for j in 0..self.mlp_w1.cols.min(d_m) {
+                let mut product = 0.0f32;
+                for r in 0..rank {
+                    product += self.adapters[0].up_proj.data[i * rank + r]
+                        * self.adapters[0].down_proj.data[r * d_m + j];
+                }
+                if product.abs() > 1e-7 {
+                    let base_idx = i * self.mlp_w1.cols + j;
+                    self.mlp_w1.data[base_idx] = (1.0 - alpha) * self.mlp_w1.data[base_idx]
+                        + alpha * product;
                 }
             }
         }

@@ -89,7 +89,7 @@ impl Tokenizer {
         }
 
         let mut sorted_tokens: Vec<(String, usize)> = frequency_map.into_iter().collect();
-        sorted_tokens.sort_by(|a, b| b.1.cmp(&a.1));
+        sorted_tokens.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
         let mut token_to_id = HashMap::new();
         let mut id_to_token = HashMap::new();

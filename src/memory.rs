@@ -1,3 +1,4 @@
+use crate::defense::{RateLimiterGate, UpdateOutcome};
 use crate::linalg::dot_slice;
 use std::f32;
 
@@ -13,6 +14,8 @@ pub struct HyperbolicEpisodicBankV2 {
     pub keys: Vec<f32>,     // [capacity x dim_key]
     pub values: Vec<f32>,   // [capacity x dim_val]
     pub norm_sq: Vec<f32>,  // [capacity]
+    pub confidence: Vec<f32>,
+    pub last_seen_step: Vec<usize>,
 }
 
 impl HyperbolicEpisodicBankV2 {
@@ -26,6 +29,8 @@ impl HyperbolicEpisodicBankV2 {
             keys: vec![0.0; capacity * dim_key],
             values: vec![0.0; capacity * dim_val],
             norm_sq: vec![0.0; capacity],
+            confidence: vec![1.0; capacity],
+            last_seen_step: vec![0; capacity],
         }
     }
 
@@ -74,7 +79,39 @@ impl HyperbolicEpisodicBankV2 {
 
         let v_off = idx * self.dim_val;
         self.values[v_off..v_off + self.dim_val].copy_from_slice(val);
+        self.confidence[idx] = 1.0;
+        self.last_seen_step[idx] = 0;
         idx
+    }
+
+    pub fn insert_protected(
+        &mut self,
+        key_pnc: &[f32],
+        val: &[f32],
+        surprise: f32,
+        current_step: usize,
+    ) -> Option<usize> {
+        if self.count < self.capacity {
+            let idx = self.insert(key_pnc, val);
+            self.last_seen_step[idx] = current_step;
+            return Some(idx);
+        }
+
+        let idx = self.write_head;
+        match RateLimiterGate::apply_refractory_overwrite(
+            &mut self.confidence[idx],
+            &mut self.last_seen_step[idx],
+            current_step,
+            surprise,
+        ) {
+            UpdateOutcome::Defended { .. } => None,
+            UpdateOutcome::Overwritten => {
+                let inserted = self.insert(key_pnc, val);
+                self.last_seen_step[inserted] = current_step;
+                Some(inserted)
+            }
+            UpdateOutcome::Stable { .. } => None,
+        }
     }
 
     /// Continuous soft-attention retrieval over the hyperbolic episodic store

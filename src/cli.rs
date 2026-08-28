@@ -255,17 +255,24 @@ impl CLIHandler {
 
         println!("\n[PHASE 1] Multi-Channel SSM Sequence Chunk Training (L=64 TBPTT)");
         let total_training_start = Instant::now();
-        let total_chunks_per_epoch = token_ids.len() / model.cfg.chunk_len;
-        let total_steps = total_chunks_per_epoch * epochs;
+        let total_chunks_per_epoch = token_ids
+            .len()
+            .saturating_sub(1)
+            .div_ceil(model.cfg.chunk_len);
+        let accumulation_chunks = 8usize;
+        let total_steps = (total_chunks_per_epoch * epochs).div_ceil(accumulation_chunks);
 
         let mut global_step = 0;
 
         for epoch in 1..=epochs {
+            model.reset_recurrent_state();
+            model.zero_gradients();
             let epoch_start = Instant::now();
             let mut last_progress = 0;
             let mut last_time = Instant::now();
             let mut running_loss = 0.0f32;
             let mut chunk_count = 0;
+            let mut accumulated_chunks = 0;
 
             let chunk_iter = TokenChunkIterator::new(&token_ids, model.cfg.chunk_len);
 
@@ -277,8 +284,20 @@ impl CLIHandler {
                 let loss = model.forward_train_chunk(inputs, targets);
                 running_loss += loss;
 
-                // 2. Exact Truncated Backpropagation Through Time (TBPTT) + AdamW step
-                model.backward_and_step_chunk(inputs.len());
+                // 2. Accumulate normalized TBPTT gradients before applying AdamW.
+                accumulated_chunks += 1;
+                model.backward_chunk(inputs.len(), 1.0 / accumulation_chunks as f32);
+
+                let apply_update = accumulated_chunks == accumulation_chunks
+                    || chunk_count == total_chunks_per_epoch;
+                if apply_update {
+                    let progress = model.step_counter as f32 / total_steps.max(1) as f32;
+                    let cosine = (std::f32::consts::PI * progress.min(1.0)).cos();
+                    let lr = 1e-5 + 0.5 * (model.cfg.lr - 1e-5) * (1.0 + cosine);
+                    model.apply_adamw(lr);
+                    model.zero_gradients();
+                    accumulated_chunks = 0;
+                }
 
                 // 3. Periodic episodic memory insertion on high-loss transitions
                 if loss > 3.5 {
@@ -287,7 +306,12 @@ impl CLIHandler {
                     let last_q = &model.tape.q_poincare[q_off..q_off + model.cfg.d_mem_key];
                     let v_off = last_t * model.cfg.d_latent;
                     let last_v = &model.tape.z_final[v_off..v_off + model.cfg.d_latent];
-                    model.memory.insert(last_q, last_v);
+                    model.memory.insert_protected(
+                        last_q,
+                        last_v,
+                        loss,
+                        model.step_counter,
+                    );
                 }
 
                 // Progress logging every 100 chunks
@@ -412,7 +436,7 @@ impl CLIHandler {
     // =========================================================================
     // TEXT GENERATION
     // =========================================================================
-    pub fn run_generate(prompt: &str, data_arg: &str, model_path: &str) {
+    pub fn run_generate(prompt: &str, data_arg: &str, model_path: &str, temperature: f32) {
         let mut model = Self::load_model_v2(model_path).unwrap_or_else(|_| {
             println!("[WARN] Model '{}' not found. Training model first...", model_path);
             Self::run_training(data_arg, 4, model_path);
@@ -422,11 +446,12 @@ impl CLIHandler {
         let raw_corpus = DatasetManager::load_dataset(Some(data_arg));
         let tokenizer = Tokenizer::from_corpus(&raw_corpus, true);
 
+        let greedy = temperature <= 0.05;
         let inf_cfg = InferenceConfig {
-            temperature: 0.35,
+            temperature,
             top_p: 0.85,
-            top_k: 24,
-            repetition_penalty: 1.25,
+            top_k: if greedy { 1 } else { 24 },
+            repetition_penalty: if greedy { 1.0 } else { 1.25 },
             max_new_tokens: 64,
         };
 
@@ -527,8 +552,8 @@ impl CLIHandler {
 
         println!("--- [Milestone 5: Generation Test] ---");
         Self::run_training("science", 2, "data/model_v2.pssa");
-        Self::run_generate("the solar system", "science", "data/model_v2.pssa");
-        Self::run_generate("quantum mechanics", "science", "data/model_v2.pssa");
+        Self::run_generate("the solar system", "science", "data/model_v2.pssa", 0.05);
+        Self::run_generate("quantum mechanics", "science", "data/model_v2.pssa", 0.05);
     }
 
     pub fn print_help() {
@@ -581,7 +606,8 @@ impl CLIHandler {
                 }
                 let data = parser.get_pos_or_flag(3, "--data", "-d", &default_data);
                 let model = parser.get_str("--model", "-m", "data/model.pssa");
-                Self::run_generate(&prompt, &data, &model);
+                let temp = parser.get_f32("--temp", "-t", 0.70);
+                Self::run_generate(&prompt, &data, &model, temp);
             }
             "download" => {
                 if args.len() < 3 {
