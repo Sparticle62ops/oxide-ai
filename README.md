@@ -19,7 +19,7 @@ The repository is a research prototype rather than a production language model. 
 
 ## Status
 
-This codebase is under active development. The checked-in source currently has no automated unit or integration tests. The CLI build should be treated as experimental; validate the current branch with `cargo check` before relying on it.
+This codebase is under active development and is covered by Cargo unit/integration tests. The CLI is still an experimental local research tool; validate the current branch with `cargo test --release` before relying on a checkpoint.
 
 ## Requirements
 
@@ -27,7 +27,7 @@ This codebase is under active development. The checked-in source currently has n
 - Network access only when using an HTTP/HTTPS dataset or Hugging Face dataset.
 - Sufficient memory and disk space for larger downloaded corpora and serialized models.
 
-The only direct runtime dependency is [`ureq`](https://crates.io/crates/ureq), used for HTTPS and HTTP dataset downloads. No GPU runtime is required. (Support for wGpu is under development!)
+Direct runtime dependencies include [`ureq`](https://crates.io/crates/ureq), used for HTTPS and HTTP dataset downloads, and the maintained [`tokenizers`](https://crates.io/crates/tokenizers) crate for standard byte-level BPE. No GPU runtime is required. (Support for wGpu is under development!)
 
 ## Quick Start
 
@@ -45,11 +45,19 @@ The executable is written to `target/release/oxide_ai_pssa`. You can also use Ca
 cargo run -- help
 ```
 
-Train a model using the bundled downloaded corpus:
+Train a model using the bundled downloaded corpus. The default is standard unnormalized ByteLevel BPE, trained only on the supplied corpus, with a maximum vocabulary of 2,048 entries:
 
 ```bash
-cargo run -- train data/downloaded.txt --epochs 4 --out data/model.pssa
+cargo run --release -- train data/downloaded.txt --epochs 4 --out data/model.pssa
 ```
+
+Use the explicit legacy tokenizer only for compatibility experiments:
+
+```bash
+cargo run --release -- train data/downloaded.txt --tokenizer word --epochs 4 --out data/word-model.pssa
+```
+
+`--max-tokens N` is a global cap across the input documents (not a per-document cap). Byte-level BPE preserves UTF-8 case, whitespace, punctuation, and arbitrary unseen Unicode without `<unk>` fallback.
 
 Start the interactive REPL:
 
@@ -136,7 +144,7 @@ cargo run -- train science,data/downloaded.txt
 
 The loader first tries to read local paths. A missing non-special source is treated as a Hugging Face repository name. Remote Hugging Face loading probes the datasets server and several conventional raw-file names. JSON-like responses are reduced using common fields such as `text`, `content`, `article`, `story`, `instruction`, `output`, `sentence`, and `summary`.
 
-Tokenization lowercases text when used by the CLI, keeps alphanumeric words plus hyphens and apostrophes, and separates `.`, `,`, `?`, and `!` into individual tokens. Vocabularies are capped at 10,000 entries; rare tokens in larger corpora map to `<unk>`.
+CLI training defaults to unnormalized byte-level BPE: it keeps exact UTF-8 case, whitespace, punctuation, and line endings, and has a complete 256-byte fallback alphabet so valid UTF-8 input does not collapse to `<unk>`. `--vocab-size` is a BPE maximum (default 2,048). The previous lowercase word splitter, including its 10,000-word cap and `<unk>` behavior, is available only with `--tokenizer word`.
 
 Download a Hugging Face dataset into a local text file:
 
@@ -157,6 +165,10 @@ The default training configuration uses a vocabulary-sized input/output, latent 
 
 The resulting binary contains model weights, configuration, memory, adapters, and related state. It is not a portable interchange format for other ML frameworks and should be loaded through `PSSALayer::import_from_pssa_bytes`.
 
+## Checkpoint compatibility
+
+New saves use **V7**: the full V6 training/resume payload plus a bounded, length-prefixed standard tokenizer JSON. A V7 BPE checkpoint is self-contained and restores its exact ordered vocabulary without access to the training or evaluation corpus. `generate` and `chat` reject `--data` for V7 BPE because retraining a tokenizer on external data would not validate provenance. V7 word checkpoints and V6 checkpoints retain the legacy optional `--data` exact-vocabulary comparison. Checked V5 artifacts remain inference-only and require `--data` because they never contained tokenizer provenance.
+
 ## Inference
 
 Generation is autoregressive and uses:
@@ -168,7 +180,7 @@ Generation is autoregressive and uses:
 - `<unk>` suppression.
 - A maximum of 45 new tokens in the current CLI configuration, ending early after two generated periods.
 
-The tokenizer used at inference time is rebuilt from the selected dataset. For useful results, use the same corpus or vocabulary source that was used to train the model. The CLI warns when the current dataset vocabulary size differs from the serialized model vocabulary.
+V7 BPE inference restores the exact embedded tokenizer and never rebuilds it from a selected dataset. Its `--data` option is rejected for generation/chat because it is a legacy word-tokenizer provenance check, not BPE training input. Evaluation supplies its data only as held-out text to the restored tokenizer.
 
 ## Benchmark
 
