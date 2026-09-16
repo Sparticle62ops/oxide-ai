@@ -31,7 +31,15 @@ impl ParamVector {
         self.grad.fill(0.0);
     }
 
-    pub fn step_adamw(&mut self, lr: f32, beta1: f32, beta2: f32, weight_decay: f32, eps: f32, step: usize) {
+    pub fn step_adamw(
+        &mut self,
+        lr: f32,
+        beta1: f32,
+        beta2: f32,
+        weight_decay: f32,
+        eps: f32,
+        step: usize,
+    ) {
         let step_f = step as f32;
         let bias_corr1 = 1.0 - beta1.powf(step_f);
         let bias_corr2 = 1.0 - beta2.powf(step_f);
@@ -49,7 +57,6 @@ impl ParamVector {
             self.data[i] -= lr * m_hat / (v_hat.sqrt() + eps);
         }
     }
-
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -121,7 +128,16 @@ impl ParamMatrix {
         }
     }
 
-    pub fn step_adamw_row(&mut self, row: usize, lr: f32, beta1: f32, beta2: f32, weight_decay: f32, eps: f32, step: usize) {
+    pub fn step_adamw_row(
+        &mut self,
+        row: usize,
+        lr: f32,
+        beta1: f32,
+        beta2: f32,
+        weight_decay: f32,
+        eps: f32,
+        step: usize,
+    ) {
         assert!(row < self.rows);
         let step_f = step as f32;
         let bias_corr1 = 1.0 - beta1.powf(step_f);
@@ -143,7 +159,15 @@ impl ParamMatrix {
         }
     }
 
-    pub fn step_adamw(&mut self, lr: f32, beta1: f32, beta2: f32, weight_decay: f32, eps: f32, step: usize) {
+    pub fn step_adamw(
+        &mut self,
+        lr: f32,
+        beta1: f32,
+        beta2: f32,
+        weight_decay: f32,
+        eps: f32,
+        step: usize,
+    ) {
         let step_f = step as f32;
         let bias_corr1 = 1.0 - beta1.powf(step_f);
         let bias_corr2 = 1.0 - beta2.powf(step_f);
@@ -182,6 +206,45 @@ pub struct PSSAConfigV2 {
     pub eps: f32,
     pub tau_mem: f32,
     pub ema_alpha: f32,
+}
+
+impl PSSAConfigV2 {
+    pub fn validate(&self) {
+        assert!(
+            self.d_vocab > 0
+                && self.d_latent > 0
+                && self.d_state > 0
+                && self.d_mem_key > 0
+                && self.mem_capacity > 0
+                && self.chunk_len > 0,
+            "all model dimensions, memory capacity, and chunk length must be positive"
+        );
+        assert!(
+            self.lr.is_finite()
+                && self.lr > 0.0
+                && self.eps.is_finite()
+                && self.eps > 0.0
+                && self.tau_mem.is_finite()
+                && self.tau_mem > 0.0,
+            "lr, eps, and tau_mem must be finite and positive"
+        );
+        assert!(
+            self.beta1.is_finite()
+                && self.beta1 >= 0.0
+                && self.beta1 < 1.0
+                && self.beta2.is_finite()
+                && self.beta2 >= 0.0
+                && self.beta2 < 1.0,
+            "Adam betas must be in [0, 1)"
+        );
+        assert!(
+            self.weight_decay.is_finite()
+                && self.weight_decay >= 0.0
+                && self.ema_alpha.is_finite()
+                && (0.0..=1.0).contains(&self.ema_alpha),
+            "weight decay must be nonnegative and ema_alpha must be in [0, 1]"
+        );
+    }
 }
 
 impl Default for PSSAConfigV2 {
@@ -243,7 +306,15 @@ pub struct ChunkActivationTape {
 }
 
 impl ChunkActivationTape {
-    pub fn new(max_l: usize, d_vocab: usize, d_latent: usize, d_state: usize, d_key: usize, mem_cap: usize, rank: usize) -> Self {
+    pub fn new(
+        max_l: usize,
+        d_vocab: usize,
+        d_latent: usize,
+        d_state: usize,
+        d_key: usize,
+        mem_cap: usize,
+        rank: usize,
+    ) -> Self {
         Self {
             max_l,
             x_ids: vec![0; max_l],
@@ -288,6 +359,12 @@ pub struct PSSALayerV2 {
     pub step_counter: usize,
     pub device: Device,
     pub rng: SimpleRng,
+    /// Ordered tokenizer token strings persisted in V6 checkpoints. Empty means
+    /// no tokenizer identity is attached (notably checked legacy V5 warm starts).
+    pub vocabulary: Vec<String>,
+    /// Exact serialized standard tokenizer metadata for V7 byte-level BPE.
+    /// `None` denotes the legacy word tokenizer policy.
+    pub tokenizer_json: Option<String>,
 
     // 1. Learned Affine RMSNorm & Embeddings
     pub embed_w: ParamMatrix,
@@ -336,6 +413,10 @@ pub struct PSSALayerV2 {
     pub buf_g_ad_down: Vec<f32>,
     pub buf_g_m_proj_out: Vec<f32>,
     pub buf_g_m_val: Vec<f32>,
+    /// Retrieval-query adjoints, reused per reverse-time step.
+    pub g_query_pnc: Vec<f32>,
+    pub g_query_euc: Vec<f32>,
+    pub g_y_ssm: Vec<f32>,
     pub buf_g_delta: Vec<f32>,
     pub buf_g_b_proj: Vec<f32>,
     pub buf_g_c_proj: Vec<f32>,
@@ -367,6 +448,11 @@ impl PSSALayerV2 {
     }
 
     pub fn new_with_device(cfg: PSSAConfigV2, seed: u64, device: Device) -> Self {
+        cfg.validate();
+        assert!(
+            !device.is_gpu(),
+            "Device::Gpu is not dispatched by PSSALayerV2; use Device::Cpu"
+        );
         let mut rng = SimpleRng::new(seed);
         let d_v = cfg.d_vocab;
         let d_m = cfg.d_latent;
@@ -387,9 +473,15 @@ impl PSSALayerV2 {
         let ln_max = 200.0f32.ln();
         for i in 0..d_m {
             for j in 0..d_s {
-                let ratio = if d_s > 1 { j as f32 / (d_s - 1) as f32 } else { 0.0 };
+                let ratio = if d_s > 1 {
+                    j as f32 / (d_s - 1) as f32
+                } else {
+                    0.0
+                };
                 let tau = (ln_min + ratio * (ln_max - ln_min)).exp();
-                a_mat.data[i * d_s + j] = -1.0 / tau;
+                // Store an unconstrained raw rate. Physical A is -softplus(raw).
+                let rate = 1.0 / tau;
+                a_mat.data[i * d_s + j] = rate.exp_m1().ln();
             }
         }
 
@@ -418,6 +510,8 @@ impl PSSALayerV2 {
             step_counter: 0,
             device,
             rng,
+            vocabulary: Vec::new(),
+            tokenizer_json: None,
             embed_w,
             norm_gamma,
             norm_beta,
@@ -450,6 +544,9 @@ impl PSSALayerV2 {
             buf_g_ad_down: vec![0.0; rank],
             buf_g_m_proj_out: vec![0.0; d_m],
             buf_g_m_val: vec![0.0; d_m],
+            g_query_pnc: vec![0.0; d_k],
+            g_query_euc: vec![0.0; d_k],
+            g_y_ssm: vec![0.0; d_m],
             buf_g_delta: vec![0.0; d_m],
             buf_g_b_proj: vec![0.0; d_s],
             buf_g_c_proj: vec![0.0; d_s],
@@ -497,7 +594,8 @@ impl PSSALayerV2 {
         let inv_rms = 1.0 / (sum_sq / (d_m as f32) + 1e-5).sqrt();
 
         for i in 0..d_m {
-            self.inf_x_norm[i] = self.norm_gamma.data[i] * (e_t[i] * inv_rms) + self.norm_beta.data[i];
+            self.inf_x_norm[i] =
+                self.norm_gamma.data[i] * (e_t[i] * inv_rms) + self.norm_beta.data[i];
         }
 
         // 2. Data-Dependent Projections
@@ -517,7 +615,7 @@ impl PSSALayerV2 {
 
             for j in 0..d_s {
                 let idx = row_off + j;
-                let bar_a = (d_i * self.a_mat.data[idx]).exp();
+                let bar_a = (d_i * -softplus(self.a_mat.data[idx])).exp();
                 let bar_b = d_i * self.inf_b[j];
 
                 let h_val = bar_a * self.h_persistent[idx] + bar_b * self.inf_x_norm[i];
@@ -531,7 +629,8 @@ impl PSSALayerV2 {
         for r in 0..d_k {
             let row_x = &self.w_qx.data[r * d_m..(r + 1) * d_m];
             let row_h = &self.w_qh.data[r * d_m..(r + 1) * d_m];
-            self.inf_q_euc[r] = dot_slice(row_x, &self.inf_x_norm) + dot_slice(row_h, &self.inf_y_ssm);
+            self.inf_q_euc[r] =
+                dot_slice(row_x, &self.inf_x_norm) + dot_slice(row_h, &self.inf_y_ssm);
         }
 
         HyperbolicEpisodicBankV2::diffeomorphic_project(&self.inf_q_euc, &mut self.inf_q_pnc);
@@ -551,12 +650,14 @@ impl PSSALayerV2 {
         self.w_proj.matvec(&self.inf_m_val, &mut self.inf_m_proj);
 
         // 5. Plastic Adapter
-        self.adapters[0].down_proj.matvec(&self.inf_x_norm, &mut self.inf_ad_act[..rank]);
+        self.adapters[0]
+            .down_proj
+            .matvec(&self.inf_x_norm, &mut self.inf_ad_act[..rank]);
         for r in 0..rank {
             let h = self.inf_ad_act[r];
             self.inf_ad_act[r] = h * sigmoid(h);
         }
-        self.adapters[0].up_proj.matvec(&self.inf_ad_act[..rank], &mut self.inf_ad_out);
+        self.adapters[0].total_up_matvec(&self.inf_ad_act[..rank], &mut self.inf_ad_out);
 
         // 6. Latent Aggregation & SiLU MLP Expansion
         for i in 0..d_m {
@@ -565,13 +666,15 @@ impl PSSALayerV2 {
                 + self.inf_ad_out[i];
         }
 
-        self.mlp_w1.matvec(&self.inf_z_raw, &mut self.inf_mlp_act[..d_mlp]);
+        self.mlp_w1
+            .matvec(&self.inf_z_raw, &mut self.inf_mlp_act[..d_mlp]);
         for i in 0..d_mlp {
             let h = self.inf_mlp_act[i];
             self.inf_mlp_act[i] = h * sigmoid(h);
         }
 
-        self.mlp_w2.matvec(&self.inf_mlp_act[..d_mlp], &mut self.inf_mlp_out);
+        self.mlp_w2
+            .matvec(&self.inf_mlp_act[..d_mlp], &mut self.inf_mlp_out);
         for i in 0..d_m {
             self.inf_z_final[i] = self.inf_z_raw[i] + self.inf_mlp_out[i];
         }
@@ -587,7 +690,21 @@ impl PSSALayerV2 {
     // 2. TBPTT SEQUENCE TRAINING PATHWAY
     // =========================================================================
     pub fn forward_train_chunk(&mut self, token_ids: &[usize], target_ids: &[usize]) -> f32 {
+        assert!(!token_ids.is_empty(), "training chunk must be nonempty");
+        assert_eq!(
+            token_ids.len(),
+            target_ids.len(),
+            "token and target counts must match"
+        );
         let seq_len = token_ids.len().min(self.cfg.chunk_len);
+        assert!(seq_len > 0);
+        assert!(
+            token_ids[..seq_len].iter().all(|&id| id < self.cfg.d_vocab)
+                && target_ids[..seq_len]
+                    .iter()
+                    .all(|&id| id < self.cfg.d_vocab),
+            "token IDs must be in vocabulary"
+        );
         let d_m = self.cfg.d_latent;
         let d_s = self.cfg.d_state;
         let d_k = self.cfg.d_mem_key;
@@ -616,24 +733,28 @@ impl PSSALayerV2 {
 
             let xn_off = t * d_m;
             for i in 0..d_m {
-                self.tape.x_norm[xn_off + i] = self.norm_gamma.data[i] * (e_t[i] * inv_rms) + self.norm_beta.data[i];
+                self.tape.x_norm[xn_off + i] =
+                    self.norm_gamma.data[i] * (e_t[i] * inv_rms) + self.norm_beta.data[i];
             }
             let x_n = &self.tape.x_norm[xn_off..xn_off + d_m];
 
             // 2. Data-Dependent Projections
             let del_off = t * d_m;
-            self.w_delta.matvec(x_n, &mut self.tape.delta_raw[del_off..del_off + d_m]);
+            self.w_delta
+                .matvec(x_n, &mut self.tape.delta_raw[del_off..del_off + d_m]);
             for i in 0..d_m {
                 self.tape.delta[del_off + i] = softplus(self.tape.delta_raw[del_off + i]);
             }
             let delta = &self.tape.delta[del_off..del_off + d_m];
 
             let b_off = t * d_s;
-            self.w_b.matvec(x_n, &mut self.tape.b_proj[b_off..b_off + d_s]);
+            self.w_b
+                .matvec(x_n, &mut self.tape.b_proj[b_off..b_off + d_s]);
             let b_p = &self.tape.b_proj[b_off..b_off + d_s];
 
             let c_off = t * d_s;
-            self.w_c.matvec(x_n, &mut self.tape.c_proj[c_off..c_off + d_s]);
+            self.w_c
+                .matvec(x_n, &mut self.tape.c_proj[c_off..c_off + d_s]);
             let c_p = &self.tape.c_proj[c_off..c_off + d_s];
 
             // 3. Multi-Channel SSM Recurrent Scan
@@ -647,7 +768,7 @@ impl PSSALayerV2 {
                 let mut y_i = 0.0f32;
                 for j in 0..d_s {
                     let idx = i * d_s + j;
-                    let bar_a = (d_i * self.a_mat.data[idx]).exp();
+                    let bar_a = (d_i * -softplus(self.a_mat.data[idx])).exp();
                     let bar_b = d_i * b_p[j];
 
                     self.tape.bar_a[ssm_off + idx] = bar_a;
@@ -684,12 +805,14 @@ impl PSSALayerV2 {
                 &mut self.tape.mem_weights[mw_off..mw_off + mem_cap],
             );
 
-            self.w_gate.matvec(x_n, &mut self.tape.g_mem[m_off..m_off + d_m]);
+            self.w_gate
+                .matvec(x_n, &mut self.tape.g_mem[m_off..m_off + d_m]);
             for i in 0..d_m {
                 self.tape.g_mem[m_off + i] = sigmoid(self.tape.g_mem[m_off + i]);
             }
 
-            self.w_proj.matvec(&self.tape.m_val[m_off..m_off + d_m], &mut self.buf_m_proj);
+            self.w_proj
+                .matvec(&self.tape.m_val[m_off..m_off + d_m], &mut self.buf_m_proj);
             for i in 0..d_m {
                 self.tape.m_proj[m_off + i] = self.buf_m_proj[i];
                 self.tape.m_inj[m_off + i] = self.tape.g_mem[m_off + i] * self.buf_m_proj[i];
@@ -697,29 +820,37 @@ impl PSSALayerV2 {
 
             // 5. Zero-Init Plastic Adapter
             let ad_off = t * rank;
-            self.adapters[0].down_proj.matvec(x_n, &mut self.tape.adapter_hidden[ad_off..ad_off + rank]);
+            self.adapters[0]
+                .down_proj
+                .matvec(x_n, &mut self.tape.adapter_hidden[ad_off..ad_off + rank]);
             for r in 0..rank {
                 let h = self.tape.adapter_hidden[ad_off + r];
                 self.tape.adapter_act[ad_off + r] = h * sigmoid(h);
             }
-            self.adapters[0].up_proj.matvec(&self.tape.adapter_act[ad_off..ad_off + rank], &mut self.buf_ad_out);
+            self.adapters[0].total_up_matvec(
+                &self.tape.adapter_act[ad_off..ad_off + rank],
+                &mut self.buf_ad_out,
+            );
 
             // 6. Latent Aggregation & SiLU MLP Expansion
             let z_off = t * d_m;
             for i in 0..d_m {
-                self.tape.z_raw[z_off + i] = (y_ssm[i] * ssm_scale)
-                    + self.tape.m_inj[m_off + i]
-                    + self.buf_ad_out[i];
+                self.tape.z_raw[z_off + i] =
+                    (y_ssm[i] * ssm_scale) + self.tape.m_inj[m_off + i] + self.buf_ad_out[i];
             }
             let z_raw = &self.tape.z_raw[z_off..z_off + d_m];
 
             let mlp_off = t * d_mlp;
-            self.mlp_w1.matvec(z_raw, &mut self.tape.mlp_hidden[mlp_off..mlp_off + d_mlp]);
+            self.mlp_w1
+                .matvec(z_raw, &mut self.tape.mlp_hidden[mlp_off..mlp_off + d_mlp]);
             for i in 0..d_mlp {
                 let h = self.tape.mlp_hidden[mlp_off + i];
                 self.tape.mlp_act[mlp_off + i] = h * sigmoid(h);
             }
-            self.mlp_w2.matvec(&self.tape.mlp_act[mlp_off..mlp_off + d_mlp], &mut self.tape.z_final[z_off..z_off + d_m]);
+            self.mlp_w2.matvec(
+                &self.tape.mlp_act[mlp_off..mlp_off + d_mlp],
+                &mut self.tape.z_final[z_off..z_off + d_m],
+            );
             for i in 0..d_m {
                 self.tape.z_final[z_off + i] += z_raw[i];
             }
@@ -727,7 +858,8 @@ impl PSSALayerV2 {
 
             // 7. Output Vocabulary Logits & Softmax Loss
             let log_off = t * d_v;
-            self.unembed_w.matvec(z_final, &mut self.tape.logits[log_off..log_off + d_v]);
+            self.unembed_w
+                .matvec(z_final, &mut self.tape.logits[log_off..log_off + d_v]);
             for i in 0..d_v {
                 self.tape.logits[log_off + i] *= logit_scale;
             }
@@ -751,13 +883,15 @@ impl PSSALayerV2 {
                 self.tape.probs[log_off + i] *= inv_sum;
             }
 
-            let nll_loss = -self.tape.probs[log_off + tgt_id].max(1e-12).ln();
+            // Exact stable log-sum-exp CE, not a probability floor/cap.
+            let nll_loss = (max_l - self.tape.logits[log_off + tgt_id]) + sum_exp.ln();
             self.tape.losses[t] = nll_loss;
             total_loss += nll_loss;
         }
 
         let last_h_off = seq_len * (d_m * d_s);
-        self.h_persistent.copy_from_slice(&self.tape.h_states[last_h_off..last_h_off + d_m * d_s]);
+        self.h_persistent
+            .copy_from_slice(&self.tape.h_states[last_h_off..last_h_off + d_m * d_s]);
 
         total_loss / (seq_len as f32)
     }
@@ -784,8 +918,14 @@ impl PSSALayerV2 {
     }
 
     pub fn backward_chunk(&mut self, seq_len: usize, accumulation_scale: f32) {
+        assert!(
+            seq_len > 0 && seq_len <= self.cfg.chunk_len,
+            "backward sequence length must be within tape capacity"
+        );
+        assert!(accumulation_scale.is_finite());
         let d_m = self.cfg.d_latent;
         let d_s = self.cfg.d_state;
+        let d_k = self.cfg.d_mem_key;
         let d_v = self.cfg.d_vocab;
         let d_mlp = d_m * 2;
         let rank = self.adapters[0].rank;
@@ -807,61 +947,29 @@ impl PSSALayerV2 {
             let z_off = t * d_m;
             let log_off = t * d_v;
 
-            // 1. Output Cross-Entropy Adjoint (SPARSE PRECISION BOUNDED)
+            // 1. Exact full-vocabulary cross-entropy adjoint.  Every class
+            // contributes, including arbitrarily small non-target probabilities.
             self.grad_z_final.fill(0.0);
-            
             for i in 0..d_v {
-                let prob = self.tape.probs[log_off + i];
-                let is_target = i == tgt_id;
-                
-                // RESTORED: Prune 99.5% of mathematically irrelevant updates (< epsilon)
-                if prob < 1e-5 && !is_target {
-                    continue;
-                }
-
-                let indicator = if is_target { 1.0 } else { 0.0 };
-                let g_logit = (prob - indicator) * scale_loss * logit_scale;
-
+                let indicator = if i == tgt_id { 1.0 } else { 0.0 };
+                let g_logit = (self.tape.probs[log_off + i] - indicator) * scale_loss * logit_scale;
                 let row_off = i * d_m;
-                
-                // 8-way unrolled gradient accumulation
-                for j in (0..d_m).step_by(8) {
+                for j in 0..d_m {
                     self.grad_z_final[j] += g_logit * self.unembed_w.data[row_off + j];
-                    self.grad_z_final[j + 1] += g_logit * self.unembed_w.data[row_off + j + 1];
-                    self.grad_z_final[j + 2] += g_logit * self.unembed_w.data[row_off + j + 2];
-                    self.grad_z_final[j + 3] += g_logit * self.unembed_w.data[row_off + j + 3];
-                    self.grad_z_final[j + 4] += g_logit * self.unembed_w.data[row_off + j + 4];
-                    self.grad_z_final[j + 5] += g_logit * self.unembed_w.data[row_off + j + 5];
-                    self.grad_z_final[j + 6] += g_logit * self.unembed_w.data[row_off + j + 6];
-                    self.grad_z_final[j + 7] += g_logit * self.unembed_w.data[row_off + j + 7];
-
                     self.unembed_w.grad[row_off + j] += g_logit * self.tape.z_final[z_off + j];
-                    self.unembed_w.grad[row_off + j + 1] += g_logit * self.tape.z_final[z_off + j + 1];
-                    self.unembed_w.grad[row_off + j + 2] += g_logit * self.tape.z_final[z_off + j + 2];
-                    self.unembed_w.grad[row_off + j + 3] += g_logit * self.tape.z_final[z_off + j + 3];
-                    self.unembed_w.grad[row_off + j + 4] += g_logit * self.tape.z_final[z_off + j + 4];
-                    self.unembed_w.grad[row_off + j + 5] += g_logit * self.tape.z_final[z_off + j + 5];
-                    self.unembed_w.grad[row_off + j + 6] += g_logit * self.tape.z_final[z_off + j + 6];
-                    self.unembed_w.grad[row_off + j + 7] += g_logit * self.tape.z_final[z_off + j + 7];
                 }
             }
 
             // 2. SiLU MLP Backward
             let mlp_off = t * d_mlp;
-            self.mlp_w2.matvec_transpose(&self.grad_z_final, &mut self.buf_g_mlp_act);
+            self.mlp_w2
+                .matvec_transpose(&self.grad_z_final, &mut self.buf_g_mlp_act);
 
             for i in 0..d_m {
                 let gz_i = self.grad_z_final[i];
                 let row_off = i * d_mlp;
-                for j in (0..d_mlp).step_by(8) {
+                for j in 0..d_mlp {
                     self.mlp_w2.grad[row_off + j] += gz_i * self.tape.mlp_act[mlp_off + j];
-                    self.mlp_w2.grad[row_off + j + 1] += gz_i * self.tape.mlp_act[mlp_off + j + 1];
-                    self.mlp_w2.grad[row_off + j + 2] += gz_i * self.tape.mlp_act[mlp_off + j + 2];
-                    self.mlp_w2.grad[row_off + j + 3] += gz_i * self.tape.mlp_act[mlp_off + j + 3];
-                    self.mlp_w2.grad[row_off + j + 4] += gz_i * self.tape.mlp_act[mlp_off + j + 4];
-                    self.mlp_w2.grad[row_off + j + 5] += gz_i * self.tape.mlp_act[mlp_off + j + 5];
-                    self.mlp_w2.grad[row_off + j + 6] += gz_i * self.tape.mlp_act[mlp_off + j + 6];
-                    self.mlp_w2.grad[row_off + j + 7] += gz_i * self.tape.mlp_act[mlp_off + j + 7];
                 }
             }
 
@@ -872,20 +980,14 @@ impl PSSALayerV2 {
                 self.buf_g_mlp_hidden[i] = self.buf_g_mlp_act[i] * silu_prime;
             }
 
-            self.mlp_w1.matvec_transpose(&self.buf_g_mlp_hidden, &mut self.buf_g_zraw_mlp);
+            self.mlp_w1
+                .matvec_transpose(&self.buf_g_mlp_hidden, &mut self.buf_g_zraw_mlp);
 
             for i in 0..d_mlp {
                 let gh_i = self.buf_g_mlp_hidden[i];
                 let row_off = i * d_m;
-                for j in (0..d_m).step_by(8) {
+                for j in 0..d_m {
                     self.mlp_w1.grad[row_off + j] += gh_i * self.tape.z_raw[z_off + j];
-                    self.mlp_w1.grad[row_off + j + 1] += gh_i * self.tape.z_raw[z_off + j + 1];
-                    self.mlp_w1.grad[row_off + j + 2] += gh_i * self.tape.z_raw[z_off + j + 2];
-                    self.mlp_w1.grad[row_off + j + 3] += gh_i * self.tape.z_raw[z_off + j + 3];
-                    self.mlp_w1.grad[row_off + j + 4] += gh_i * self.tape.z_raw[z_off + j + 4];
-                    self.mlp_w1.grad[row_off + j + 5] += gh_i * self.tape.z_raw[z_off + j + 5];
-                    self.mlp_w1.grad[row_off + j + 6] += gh_i * self.tape.z_raw[z_off + j + 6];
-                    self.mlp_w1.grad[row_off + j + 7] += gh_i * self.tape.z_raw[z_off + j + 7];
                 }
             }
 
@@ -895,13 +997,14 @@ impl PSSALayerV2 {
 
             // 3. Adapter Backward
             let ad_off = t * rank;
-            self.adapters[0].up_proj.matvec_transpose(&self.grad_z_raw, &mut self.buf_g_ad_act);
+            self.adapters[0].total_up_matvec_transpose(&self.grad_z_raw, &mut self.buf_g_ad_act);
 
             for i in 0..d_m {
                 let gz_i = self.grad_z_raw[i];
                 let row_off = i * rank;
                 for r in 0..rank {
-                    self.adapters[0].up_proj.grad[row_off + r] += gz_i * self.tape.adapter_act[ad_off + r];
+                    self.adapters[0].up_proj.grad[row_off + r] +=
+                        gz_i * self.tape.adapter_act[ad_off + r];
                 }
             }
 
@@ -918,7 +1021,8 @@ impl PSSALayerV2 {
                 let row_off = r * d_m;
                 for j in 0..d_m {
                     self.grad_x_norm[j] += gad_r * self.adapters[0].down_proj.data[row_off + j];
-                    self.adapters[0].down_proj.grad[row_off + j] += gad_r * self.tape.x_norm[t * d_m + j];
+                    self.adapters[0].down_proj.grad[row_off + j] +=
+                        gad_r * self.tape.x_norm[t * d_m + j];
                 }
             }
 
@@ -938,12 +1042,81 @@ impl PSSALayerV2 {
                 }
             }
 
-            self.w_proj.matvec_transpose(&self.buf_g_m_proj_out, &mut self.buf_g_m_val);
+            self.w_proj
+                .matvec_transpose(&self.buf_g_m_proj_out, &mut self.buf_g_m_val);
             for i in 0..d_m {
                 let g_mp_i = self.buf_g_m_proj_out[i];
                 let row_off = i * d_m;
                 for j in 0..d_m {
                     self.w_proj.grad[row_off + j] += g_mp_i * self.tape.m_val[m_off + j];
+                }
+            }
+
+            // Retrieval is a full-bank softmax over -hyperbolic_distance/tau.
+            // Bank keys/values are detached stored state; only the query path learns.
+            self.g_query_pnc.fill(0.0);
+            let q_off = t * d_k;
+            let q = &self.tape.q_poincare[q_off..q_off + d_k];
+            let q_sq = dot_slice(q, q) as f64;
+            for entry in 0..self.memory.count {
+                let key_off = entry * d_k;
+                let key = &self.memory.keys[key_off..key_off + d_k];
+                let key_sq = self.memory.norm_sq[entry] as f64;
+                let mut dot_g_value_minus_mean = 0.0f64;
+                let value_off = entry * d_m;
+                for j in 0..d_m {
+                    dot_g_value_minus_mean += self.buf_g_m_val[j] as f64
+                        * (self.memory.values[value_off + j] - self.tape.m_val[m_off + j]) as f64;
+                }
+                let g_score = self.tape.mem_weights[t * self.cfg.mem_capacity + entry] as f64
+                    * dot_g_value_minus_mean;
+                let mut sq = 0.0f64;
+                for k in 0..d_k {
+                    let diff = (q[k] - key[k]) as f64;
+                    sq += diff * diff;
+                }
+                // The distance has a cusp at identical points.  We explicitly use
+                // the symmetric subgradient zero there, avoiding division by zero.
+                if sq > 0.0 {
+                    let denom = (1.0 - q_sq) * (1.0 - key_sq);
+                    assert!(denom > 0.0 && denom.is_finite());
+                    let z = sq / denom;
+                    let dd_dz = 1.0 / (z * (1.0 + z)).sqrt();
+                    for k in 0..d_k {
+                        let diff = (q[k] - key[k]) as f64;
+                        let ddenom = -2.0 * q[k] as f64 * (1.0 - key_sq);
+                        let dz = (2.0 * diff * denom - sq * ddenom) / (denom * denom);
+                        self.g_query_pnc[k] +=
+                            (g_score * (-1.0 / self.cfg.tau_mem as f64) * dd_dz * dz) as f32;
+                    }
+                }
+            }
+            let r = self.tape.q_norm[t];
+            if r == 0.0 {
+                self.g_query_euc.copy_from_slice(&self.g_query_pnc);
+            } else {
+                let q_euc = &self.tape.q_euc[q_off..q_off + d_k];
+                let mut qdotg = 0.0;
+                for k in 0..d_k {
+                    qdotg += q_euc[k] * self.g_query_pnc[k];
+                }
+                let denom = r * (1.0 + r) * (1.0 + r);
+                for k in 0..d_k {
+                    self.g_query_euc[k] =
+                        self.g_query_pnc[k] / (1.0 + r) - q_euc[k] * qdotg / denom;
+                }
+            }
+            self.g_y_ssm.fill(0.0);
+            let xn = &self.tape.x_norm[t * d_m..(t + 1) * d_m];
+            let y = &self.tape.y_ssm[t * d_m..(t + 1) * d_m];
+            for r_i in 0..d_k {
+                let gq = self.g_query_euc[r_i];
+                let row = r_i * d_m;
+                for j in 0..d_m {
+                    self.w_qx.grad[row + j] += gq * xn[j];
+                    self.w_qh.grad[row + j] += gq * y[j];
+                    self.grad_x_norm[j] += gq * self.w_qx.data[row + j];
+                    self.g_y_ssm[j] += gq * self.w_qh.data[row + j];
                 }
             }
 
@@ -961,7 +1134,7 @@ impl PSSALayerV2 {
 
             for i in 0..d_m {
                 let gz_i = self.grad_z_raw[i];
-                let g_y_i = gz_i * ssm_scale;
+                let g_y_i = gz_i * ssm_scale + self.g_y_ssm[i];
                 let d_i = self.tape.delta[del_off + i];
                 let xn_i = self.tape.x_norm[t * d_m + i];
 
@@ -970,7 +1143,8 @@ impl PSSALayerV2 {
                     let h_next = self.tape.h_states[(t + 1) * (d_m * d_s) + idx];
                     let c_val = self.tape.c_proj[c_off + j];
                     let bar_a = self.tape.bar_a[ssm_off + idx];
-                    let a_orig = self.a_mat.data[idx];
+                    let a_raw = self.a_mat.data[idx];
+                    let a_physical = -softplus(a_raw);
                     let b_val = self.tape.b_proj[b_off + j];
 
                     let g_h_total = g_y_i * c_val + self.grad_h_next[idx];
@@ -978,8 +1152,14 @@ impl PSSALayerV2 {
                     self.buf_g_c_proj[j] += g_y_i * h_next;
                     self.buf_g_h_prev[idx] += g_h_total * bar_a;
 
-                    self.a_mat.grad[idx] += g_h_total * (d_i * bar_a) * self.tape.h_states[h_prev_off + idx];
-                    self.buf_g_delta[i] += g_h_total * (a_orig * bar_a * self.tape.h_states[h_prev_off + idx] + b_val * xn_i);
+                    // dA/draw = -sigmoid(raw) for A=-softplus(raw).
+                    self.a_mat.grad[idx] += g_h_total
+                        * (d_i * bar_a)
+                        * self.tape.h_states[h_prev_off + idx]
+                        * -sigmoid(a_raw);
+                    self.buf_g_delta[i] += g_h_total
+                        * (a_physical * bar_a * self.tape.h_states[h_prev_off + idx]
+                            + b_val * xn_i);
                     self.buf_g_b_proj[j] += g_h_total * (d_i * xn_i);
                     self.grad_x_norm[i] += g_h_total * self.tape.bar_b[ssm_off + idx];
                 }
@@ -1002,7 +1182,8 @@ impl PSSALayerV2 {
                 let gc_j = self.buf_g_c_proj[j];
                 let row_off = j * d_m;
                 for k in 0..d_m {
-                    self.grad_x_norm[k] += gb_j * self.w_b.data[row_off + k] + gc_j * self.w_c.data[row_off + k];
+                    self.grad_x_norm[k] +=
+                        gb_j * self.w_b.data[row_off + k] + gc_j * self.w_c.data[row_off + k];
                     self.w_b.grad[row_off + k] += gb_j * self.tape.x_norm[t * d_m + k];
                     self.w_c.grad[row_off + k] += gc_j * self.tape.x_norm[t * d_m + k];
                 }
@@ -1025,11 +1206,11 @@ impl PSSALayerV2 {
             let emb_row_off = x_id * d_m;
             for i in 0..d_m {
                 let g_unnorm = self.grad_x_norm[i] * self.norm_gamma.data[i];
-                let g_e_i = inv_rms * (g_unnorm - e_t[i] * (dot_gx_e * inv_rms * inv_rms / (d_m as f32)));
+                let g_e_i =
+                    inv_rms * (g_unnorm - e_t[i] * (dot_gx_e * inv_rms * inv_rms / (d_m as f32)));
                 self.embed_w.grad[emb_row_off + i] += g_e_i;
             }
         }
-
     }
 
     pub fn apply_adamw(&mut self, lr: f32) {
@@ -1040,11 +1221,9 @@ impl PSSALayerV2 {
         let eps = self.cfg.eps;
         let step = self.step_counter;
 
-        for row in 0..self.embed_w.rows {
-            if self.embed_row_marks[row] == step {
-                self.embed_w.step_adamw_row(row, lr, beta1, beta2, wd, eps, step);
-            }
-        }
+        // Dense AdamW semantics: zero-gradient embedding rows still decay their
+        // moments and receive decoupled weight decay on every optimizer step.
+        self.embed_w.step_adamw(lr, beta1, beta2, wd, eps, step);
         self.norm_gamma.step_adamw(lr, beta1, beta2, 0.0, eps, step);
         self.norm_beta.step_adamw(lr, beta1, beta2, 0.0, eps, step);
         self.a_mat.step_adamw(lr, beta1, beta2, wd, eps, step);
@@ -1071,27 +1250,8 @@ impl PSSALayerV2 {
     // 4. EMA CONSOLIDATION (THE SLEEP PHASE)
     // =========================================================================
     pub fn ema_consolidate_plasticity(&mut self) {
-        let alpha = self.cfg.ema_alpha;
-        let d_m = self.cfg.d_latent;
-        let rank = self.adapters[0].rank;
-
-        // Merge the adapter's low-rank linear product into the latent-width
-        // portion of the MLP input projection.
-        for i in 0..self.mlp_w1.rows.min(d_m) {
-            for j in 0..self.mlp_w1.cols.min(d_m) {
-                let mut product = 0.0f32;
-                for r in 0..rank {
-                    product += self.adapters[0].up_proj.data[i * rank + r]
-                        * self.adapters[0].down_proj.data[r * d_m + j];
-                }
-                if product.abs() > 1e-7 {
-                    let base_idx = i * self.mlp_w1.cols + j;
-                    self.mlp_w1.data[base_idx] = (1.0 - alpha) * self.mlp_w1.data[base_idx]
-                        + alpha * product;
-                }
-            }
-        }
-
-        self.adapters[0].up_proj.data.fill(0.0);
+        // SiLU(Dx) is nonlinear, so U*D cannot be merged into the MLP without
+        // changing the function. Transfer coefficients inside the adapter instead.
+        self.adapters[0].consolidate(self.cfg.ema_alpha);
     }
 }

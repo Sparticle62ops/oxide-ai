@@ -6,5 +6,6 @@ pub mod dataset;
 pub mod pssa;
 pub mod inference;
 pub mod diagnostics;
+pub mod checkpoint;
 pub mod cli;
 pub mod backend;

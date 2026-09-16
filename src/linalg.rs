@@ -126,29 +126,94 @@ impl Vector {
     }
 }
 
+/// Returns the dot product of two equally sized slices.
+///
+/// The AVX2/FMA implementation is selected at compile time when those target
+/// features are enabled. Fused multiply-add has one rounding rather than the
+/// scalar multiply followed by add's two, so finite results are checked with a
+/// mixed absolute/relative tolerance rather than bitwise equality.
 #[inline(always)]
 pub fn dot_slice(a: &[f32], b: &[f32]) -> f32 {
-    let len = a.len().min(b.len());
-    let mut sum = 0.0f32;
-    let chunks = len / 8;
+    assert_eq!(a.len(), b.len(), "dot product operands must have equal lengths");
+
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma"))]
+    {
+        // SAFETY: the helper only reads within the equally sized input slices.
+        return unsafe { dot_slice_avx2_fma(a, b) };
+    }
+
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma")))]
+    dot_slice_portable(a, b)
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma"))]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_slice_avx2_fma(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+
+    let len = a.len();
     let a_ptr = a.as_ptr();
     let b_ptr = b.as_ptr();
+    let mut i = 0;
+    // Four independent dependency chains cover 32 floats per iteration.
+    let (mut acc0, mut acc1, mut acc2, mut acc3) = (
+        _mm256_setzero_ps(),
+        _mm256_setzero_ps(),
+        _mm256_setzero_ps(),
+        _mm256_setzero_ps(),
+    );
 
-    unsafe {
-        for i in 0..chunks {
-            let idx = i * 8;
-            sum += *a_ptr.add(idx) * *b_ptr.add(idx)
-                + *a_ptr.add(idx + 1) * *b_ptr.add(idx + 1)
-                + *a_ptr.add(idx + 2) * *b_ptr.add(idx + 2)
-                + *a_ptr.add(idx + 3) * *b_ptr.add(idx + 3)
-                + *a_ptr.add(idx + 4) * *b_ptr.add(idx + 4)
-                + *a_ptr.add(idx + 5) * *b_ptr.add(idx + 5)
-                + *a_ptr.add(idx + 6) * *b_ptr.add(idx + 6)
-                + *a_ptr.add(idx + 7) * *b_ptr.add(idx + 7);
+    while i + 32 <= len {
+        unsafe {
+            acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(a_ptr.add(i)), _mm256_loadu_ps(b_ptr.add(i)), acc0);
+            acc1 = _mm256_fmadd_ps(
+                _mm256_loadu_ps(a_ptr.add(i + 8)),
+                _mm256_loadu_ps(b_ptr.add(i + 8)),
+                acc1,
+            );
+            acc2 = _mm256_fmadd_ps(
+                _mm256_loadu_ps(a_ptr.add(i + 16)),
+                _mm256_loadu_ps(b_ptr.add(i + 16)),
+                acc2,
+            );
+            acc3 = _mm256_fmadd_ps(
+                _mm256_loadu_ps(a_ptr.add(i + 24)),
+                _mm256_loadu_ps(b_ptr.add(i + 24)),
+                acc3,
+            );
         }
-        for i in (chunks * 8)..len {
-            sum += *a_ptr.add(i) * *b_ptr.add(i);
-        }
+        i += 32;
+    }
+
+    let pair01 = _mm256_add_ps(acc0, acc1);
+    let pair23 = _mm256_add_ps(acc2, acc3);
+    let lanes = _mm256_add_ps(pair01, pair23);
+    let folded = _mm_add_ps(_mm256_castps256_ps128(lanes), _mm256_extractf128_ps(lanes, 1));
+    let pair = _mm_hadd_ps(folded, folded);
+    let mut sum = _mm_cvtss_f32(_mm_hadd_ps(pair, pair));
+    while i < len {
+        sum += a[i] * b[i];
+        i += 1;
+    }
+    sum
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma")))]
+#[inline(always)]
+fn dot_slice_portable(a: &[f32], b: &[f32]) -> f32 {
+    let mut i = 0;
+    let (mut acc0, mut acc1, mut acc2, mut acc3) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+    while i + 4 <= a.len() {
+        acc0 += a[i] * b[i];
+        acc1 += a[i + 1] * b[i + 1];
+        acc2 += a[i + 2] * b[i + 2];
+        acc3 += a[i + 3] * b[i + 3];
+        i += 4;
+    }
+    let mut sum = (acc0 + acc1) + (acc2 + acc3);
+    while i < a.len() {
+        sum += a[i] * b[i];
+        i += 1;
     }
     sum
 }

@@ -16,6 +16,9 @@ bytemuck = { version = "1.16", features = ["derive"] }
 
 # Multi-threaded CPU fallback acceleration
 rayon = "1.10"
+tokenizers = { version = "0.22.1", default-features = false, features = ["fancy-regex"] }
+# Explicit direct use validates persisted tokenizer policy before model allocation.
+serde_json = "1.0"
 
 [profile.release]
 opt-level = 3

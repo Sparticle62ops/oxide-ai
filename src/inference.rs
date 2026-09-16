@@ -1,7 +1,6 @@
-use crate::pssa::PSSALayerV2;
-use crate::dataset::Tokenizer;
+use crate::dataset::{Tokenizer, TokenizerKind};
 use crate::linalg::SimpleRng;
-use std::f32;
+use crate::pssa::PSSALayerV2;
 
 pub struct InferenceConfig {
     pub temperature: f32,
@@ -10,7 +9,6 @@ pub struct InferenceConfig {
     pub repetition_penalty: f32,
     pub max_new_tokens: usize,
 }
-
 impl Default for InferenceConfig {
     fn default() -> Self {
         Self {
@@ -28,162 +26,277 @@ pub struct PSSAInferenceEngine<'a> {
     tokenizer: &'a Tokenizer,
     rng: SimpleRng,
 }
-
 impl<'a> PSSAInferenceEngine<'a> {
-    pub fn new(model: &'a mut PSSALayerV2, tokenizer: &'a Tokenizer) -> Self {
-        Self {
+    pub fn try_new(model: &'a mut PSSALayerV2, tokenizer: &'a Tokenizer) -> Result<Self, String> {
+        if tokenizer.vocab_size < 2 || model.cfg.d_vocab < 2 {
+            return Err("generation requires a vocabulary with at least two tokens".into());
+        }
+        if tokenizer.vocab_size != model.cfg.d_vocab {
+            return Err(format!(
+                "tokenizer/model vocabulary size mismatch: {} != {}",
+                tokenizer.vocab_size, model.cfg.d_vocab
+            ));
+        }
+        if !model.vocabulary.is_empty() && model.vocabulary != tokenizer.ordered_vocabulary()? {
+            return Err("tokenizer vocabulary/order does not match checkpoint".into());
+        }
+        match (model.tokenizer_json.as_ref(), tokenizer.kind()) {
+            (Some(json), TokenizerKind::Bpe)
+                if tokenizer.serialized_metadata().as_deref() == Some(json) => {}
+            (Some(_), _) => {
+                return Err(
+                    "checkpoint BPE metadata does not exactly match inference tokenizer".into(),
+                );
+            }
+            (None, TokenizerKind::Word) => {}
+            (None, TokenizerKind::Bpe) => {
+                return Err("BPE tokenizer requires serialized checkpoint metadata".into());
+            }
+        }
+        Ok(Self {
             model,
             tokenizer,
             rng: SimpleRng::new(1337),
-        }
+        })
     }
-
-    pub fn generate_chat_turn<F>(&mut self, prompt: &str, cfg: &InferenceConfig, mut callback: F) -> String
+    pub fn new(model: &'a mut PSSALayerV2, tokenizer: &'a Tokenizer) -> Self {
+        Self::try_new(model, tokenizer).expect("invalid inference model/tokenizer")
+    }
+    fn validate(cfg: &InferenceConfig) -> Result<(), String> {
+        if !cfg.temperature.is_finite() || cfg.temperature < 0.0 {
+            return Err("temperature must be finite and >= 0".into());
+        }
+        if !(cfg.top_p.is_finite() && cfg.top_p > 0.0 && cfg.top_p <= 1.0) {
+            return Err("top-p must be finite in (0, 1]".into());
+        }
+        if cfg.top_k == 0 {
+            return Err("top-k must be positive".into());
+        }
+        if !(cfg.repetition_penalty.is_finite() && cfg.repetition_penalty >= 1.0) {
+            return Err("repetition penalty must be finite and >= 1".into());
+        }
+        Ok(())
+    }
+    fn sample(
+        &mut self,
+        cfg: &InferenceConfig,
+        generated_ids: &[usize],
+        logits: &mut [f32],
+        probs: &mut [f32],
+        candidates: &mut Vec<(usize, f32)>,
+    ) -> Result<usize, String> {
+        let d_v = self.model.cfg.d_vocab;
+        if logits.iter().any(|x| !x.is_finite()) {
+            return Err("model emitted non-finite logits".into());
+        }
+        if cfg.repetition_penalty > 1.0 {
+            for &id in &generated_ids[generated_ids.len().saturating_sub(64)..] {
+                if logits[id] > 0.0 {
+                    logits[id] /= cfg.repetition_penalty;
+                } else {
+                    logits[id] *= cfg.repetition_penalty;
+                }
+            }
+        }
+        if cfg.temperature == 0.0 {
+            return (1..d_v)
+                .max_by(|&a, &b| logits[a].total_cmp(&logits[b]).then_with(|| b.cmp(&a)))
+                .ok_or_else(|| "no valid generation candidates".into());
+        }
+        let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let mut sum = 0.0;
+        for i in 0..d_v {
+            probs[i] = ((logits[i] / cfg.temperature) - max / cfg.temperature).exp();
+            sum += probs[i];
+        }
+        if !sum.is_finite() || sum <= 0.0 {
+            return Err("invalid sampling probability mass".into());
+        }
+        candidates.clear();
+        for i in 1..d_v {
+            if probs[i].is_finite() {
+                candidates.push((i, probs[i] / sum));
+            }
+        }
+        if candidates.is_empty() {
+            return Err("no finite generation candidates".into());
+        }
+        candidates.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let k = candidates.len().min(cfg.top_k);
+        let mut cutoff = k;
+        let mut cumulative = 0.0;
+        for (i, &(_, p)) in candidates[..k].iter().enumerate() {
+            cumulative += p;
+            if cumulative >= cfg.top_p {
+                cutoff = i + 1;
+                break;
+            }
+        }
+        let filtered = &candidates[..cutoff.max(1)];
+        let mass: f32 = filtered.iter().map(|x| x.1).sum();
+        let draw = self.rng.gen_range_f32(0.0, mass);
+        let mut running = 0.0;
+        let mut id = filtered[filtered.len() - 1].0;
+        for &(candidate, p) in filtered {
+            running += p;
+            if draw <= running {
+                id = candidate;
+                break;
+            }
+        }
+        Ok(id)
+    }
+    /// Generates autoregressively. BPE callbacks receive decoded UTF-8 segments,
+    /// never internal ByteLevel labels; an incomplete final UTF-8 suffix is held.
+    pub fn try_generate_chat_turn<F>(
+        &mut self,
+        prompt: &str,
+        cfg: &InferenceConfig,
+        mut callback: F,
+    ) -> Result<String, String>
     where
         F: FnMut(&str),
     {
-        let ids = self.tokenizer.encode(prompt, true);
-        if ids.is_empty() {
-            return String::new();
+        Self::validate(cfg)?;
+        let prompt_ids = self.tokenizer.try_encode(prompt, true)?;
+        if prompt_ids.is_empty() {
+            return Err("prompt is empty after tokenization".into());
         }
-
+        if prompt_ids.iter().all(|&id| id == 0) {
+            return Err("prompt contains no known vocabulary tokens".into());
+        }
         let d_v = self.model.cfg.d_vocab;
+        let mut logits = vec![0.0f32; d_v];
+        let mut probs = vec![0.0f32; d_v];
+        let mut candidates: Vec<(usize, f32)> = Vec::with_capacity(d_v);
+        let mut generated_ids = Vec::with_capacity(prompt_ids.len() + cfg.max_new_tokens);
+        generated_ids.extend_from_slice(&prompt_ids);
         self.model.reset_recurrent_state();
-
-        let mut logits_buf = vec![0.0f32; d_v];
-        let mut probs_buf = vec![0.0f32; d_v];
-
-        // 1. Ingest Prompt Context Token-by-Token into Multi-Channel Recurrent State
-        for &in_id in &ids {
-            let clamped_id = in_id % d_v;
-            self.model.forward_inference(clamped_id, &mut logits_buf);
+        for &id in &prompt_ids {
+            if id >= d_v {
+                return Err(format!("prompt ID {id} outside model vocabulary"));
+            }
+            self.model.forward_inference(id, &mut logits);
         }
-
-        let mut generated_ids = ids.clone();
-        let mut out_text = String::new();
-        let mut sentence_count = 0;
-
-        // 2. Autoregressive Generation Loop
-        for step_i in 0..cfg.max_new_tokens {
-            if step_i > 0 {
-                let last_id = *generated_ids.last().unwrap_or(&0) % d_v;
-                self.model.forward_inference(last_id, &mut logits_buf);
-            }
-
-            // Hard ban <unk> token (ID 0)
-            if !logits_buf.is_empty() {
-                logits_buf[0] = -1e4;
-            }
-
-            // Finiteness validation
-            for val in logits_buf.iter_mut() {
-                if !val.is_finite() {
-                    *val = -1e4;
-                }
-            }
-
-            // Apply Windowed Repetition Penalty
-            let penalty = cfg.repetition_penalty.max(1.0);
-            let window_start = generated_ids.len().saturating_sub(64);
-            for &prev_id in &generated_ids[window_start..] {
-                if prev_id < logits_buf.len() {
-                    if logits_buf[prev_id] > 0.0 {
-                        logits_buf[prev_id] /= penalty;
+        match self.tokenizer.kind() {
+            TokenizerKind::Word => {
+                let mut out = String::with_capacity(cfg.max_new_tokens.saturating_mul(8));
+                let mut sentence_count = 0;
+                for step in 0..cfg.max_new_tokens {
+                    if step > 0 {
+                        self.model.forward_inference(
+                            *generated_ids.last().expect("generated token"),
+                            &mut logits,
+                        );
+                    }
+                    let selected = self.sample(
+                        cfg,
+                        &generated_ids,
+                        &mut logits,
+                        &mut probs,
+                        &mut candidates,
+                    )?;
+                    generated_ids.push(selected);
+                    let token = self
+                        .tokenizer
+                        .id_to_token
+                        .get(&selected)
+                        .ok_or_else(|| format!("missing tokenizer token ID {selected}"))?;
+                    if matches!(token.as_str(), "." | "," | "?" | "!") {
+                        out.push_str(token);
                     } else {
-                        logits_buf[prev_id] *= penalty;
+                        if !out.is_empty() {
+                            out.push(' ');
+                        }
+                        out.push_str(token);
+                    }
+                    callback(token);
+                    if matches!(token.as_str(), "." | "?" | "!") {
+                        sentence_count += 1;
+                        if sentence_count >= 2 {
+                            break;
+                        }
                     }
                 }
+                Ok(out)
             }
-
-            // Suppress direct immediate self-transition loops
-            if let Some(&last_id) = generated_ids.last() {
-                if last_id < logits_buf.len() {
-                    logits_buf[last_id] -= 2.0;
+            TokenizerKind::Bpe => {
+                let max_token_bytes = (0..self.tokenizer.vocab_size)
+                    .filter_map(|id| self.tokenizer.token_bytes(id))
+                    .map(|x| x.len())
+                    .max()
+                    .unwrap_or(1);
+                let raw_capacity = max_token_bytes.saturating_mul(cfg.max_new_tokens);
+                let mut raw = Vec::with_capacity(raw_capacity);
+                // Invalid raw bytes can each expand to U+FFFD (three bytes).
+                let mut out = String::with_capacity(raw_capacity.saturating_mul(3));
+                let mut emitted = 0usize;
+                for step in 0..cfg.max_new_tokens {
+                    if step > 0 {
+                        self.model.forward_inference(
+                            *generated_ids.last().expect("generated token"),
+                            &mut logits,
+                        );
+                    }
+                    let selected = self.sample(
+                        cfg,
+                        &generated_ids,
+                        &mut logits,
+                        &mut probs,
+                        &mut candidates,
+                    )?;
+                    generated_ids.push(selected);
+                    raw.extend_from_slice(
+                        self.tokenizer
+                            .token_bytes(selected)
+                            .ok_or_else(|| format!("missing BPE bytes for token {selected}"))?,
+                    );
+                    let begin = out.len();
+                    loop {
+                        match std::str::from_utf8(&raw[emitted..]) {
+                            Ok(valid) => {
+                                out.push_str(valid);
+                                emitted = raw.len();
+                                break;
+                            }
+                            Err(error) => {
+                                let good = error.valid_up_to();
+                                if good > 0 {
+                                    let end = emitted + good;
+                                    out.push_str(
+                                        std::str::from_utf8(&raw[emitted..end])
+                                            .expect("validated UTF-8 prefix"),
+                                    );
+                                    emitted = end;
+                                }
+                                match error.error_len() {
+                                    Some(bad) => {
+                                        out.push('\u{FFFD}');
+                                        emitted += bad;
+                                    }
+                                    None => break, // retain incomplete UTF-8 until the next token
+                                }
+                            }
+                        }
+                    }
+                    if out.len() > begin {
+                        callback(&out[begin..]);
+                    }
                 }
-            }
-
-            // Temperature Scaling
-            let temp = cfg.temperature.max(0.01);
-            for val in logits_buf.iter_mut() {
-                *val /= temp;
-            }
-
-            // Numerically Stable Softmax
-            let mut max_l = f32::NEG_INFINITY;
-            for &l in &logits_buf {
-                if l > max_l {
-                    max_l = l;
-                }
-            }
-
-            let mut sum_exp = 0.0f32;
-            for i in 0..d_v {
-                let exp_val = (logits_buf[i] - max_l).exp();
-                probs_buf[i] = exp_val;
-                sum_exp += exp_val;
-            }
-            let inv_sum = 1.0 / sum_exp.max(1e-8);
-            for i in 0..d_v {
-                probs_buf[i] *= inv_sum;
-            }
-
-            // Top-K + Top-P (Nucleus) Filtering
-            let mut candidates: Vec<(usize, f32)> = (0..d_v)
-                .filter(|&i| i != 0 && probs_buf[i].is_finite())
-                .map(|i| (i, probs_buf[i]))
-                .collect();
-
-            candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-            let top_k_len = candidates.len().min(cfg.top_k.max(1));
-            let top_candidates = &candidates[..top_k_len];
-
-            let mut cum_sum = 0.0;
-            let mut cutoff_idx = top_candidates.len();
-            let top_p = cfg.top_p.clamp(0.01, 1.0);
-
-            for (idx, &(_, p)) in top_candidates.iter().enumerate() {
-                cum_sum += p;
-                if cum_sum >= top_p {
-                    cutoff_idx = idx + 1;
-                    break;
-                }
-            }
-
-            let filtered = &top_candidates[..cutoff_idx.max(1)];
-            let total_filtered_prob: f32 = filtered.iter().map(|(_, p)| p).sum();
-            let rand_val = self.rng.gen_range_f32(0.0, total_filtered_prob.max(1e-6));
-
-            let mut running = 0.0;
-            let mut selected_id = filtered[0].0;
-            for &(id, p) in filtered {
-                running += p;
-                if running >= rand_val {
-                    selected_id = id;
-                    break;
-                }
-            }
-
-            generated_ids.push(selected_id);
-
-            let token_str = if let Some(word) = self.tokenizer.id_to_token.get(&selected_id) {
-                word.clone()
-            } else {
-                format!("[#{}]", selected_id)
-            };
-
-            callback(&token_str);
-            out_text.push_str(&token_str);
-            out_text.push(' ');
-
-            if token_str == "." {
-                sentence_count += 1;
-                if sentence_count >= 2 {
-                    break;
-                }
+                Ok(out)
             }
         }
-
-        out_text.trim().to_string()
+    }
+    pub fn generate_chat_turn<F>(
+        &mut self,
+        prompt: &str,
+        cfg: &InferenceConfig,
+        callback: F,
+    ) -> String
+    where
+        F: FnMut(&str),
+    {
+        self.try_generate_chat_turn(prompt, cfg, callback)
+            .unwrap_or_default()
     }
 }
