@@ -58,7 +58,7 @@ fn make_model() -> PSSALayerV2 {
             *x = 0.003 * (entry as f32 + 1.0) * ((i % 11) as f32 - 5.0);
         }
         // The deterministic key norm is safely inside the open Poincare ball.
-        model.memory.insert(&key, &value);
+        model.block.memory.insert(&key, &value);
     }
     model
 }

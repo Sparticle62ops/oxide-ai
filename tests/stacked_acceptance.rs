@@ -53,7 +53,12 @@ fn patterned(values: &mut [f32], base: f32, layer: usize) {
 fn fixture(depth: usize) -> PSSALayerV2 {
     let mut model = PSSALayerV2::new_with_depth(cfg(), 0x5a17, depth);
     patterned(&mut model.embed_w.data, 0.17, 0);
+    // Increase class-to-class head contrast, not a shared offset: adding the
+    // same vector to every vocabulary row cancels under softmax and cannot
+    // strengthen the loss adjoint. Four times the small original contrast
+    // keeps logits unsaturated but activates deeper branches above FD_MIN.
     patterned(&mut model.unembed_w.data, -0.11, 1);
+    for value in &mut model.unembed_w.data { *value *= 4.0; }
     for layer in 0..depth {
         let block = block_mut(&mut model, layer);
         patterned(&mut block.norm_gamma.data, 0.98, layer);
@@ -188,16 +193,23 @@ fn strongest_coordinate(derivatives: &[f32], label: &str) -> usize {
     result
 }
 
-fn assert_fd(label: &str, analytic: f32, numeric: f64) {
+fn assert_fd_match(label: &str, analytic: f32, numeric: f64) {
     let analytic = f64::from(analytic);
+    assert!(analytic.is_finite() && numeric.is_finite(), "{label}: non-finite derivative analytic={analytic:.9} numeric={numeric:.9}");
     let magnitude = analytic.abs().max(numeric.abs());
-    assert!(magnitude > f64::from(FD_MIN), "{label}: vacuous derivative analytic={analytic:.9} numeric={numeric:.9}");
     let error = (analytic - numeric).abs();
     let limit = f64::from(FD_ABS) + f64::from(FD_REL) * magnitude;
     assert!(
         error <= limit,
         "{label}: analytic={analytic:.9} numeric={numeric:.9} error={error:.9} limit={limit:.9}"
     );
+}
+
+fn assert_fd(label: &str, analytic: f32, numeric: f64) {
+    let analytic = f64::from(analytic);
+    let magnitude = analytic.abs().max(numeric.abs());
+    assert!(magnitude > f64::from(FD_MIN), "{label}: vacuous derivative analytic={analytic:.9} numeric={numeric:.9}");
+    assert_fd_match(label, analytic as f32, numeric);
 }
 
 fn numeric_shared(depth: usize, embedding: bool, coordinate: usize, original: f32) -> f64 {
@@ -256,6 +268,61 @@ fn every_stacked_block_and_shared_endpoint_has_a_live_full_model_finite_differen
                     analytic_derivative,
                     numeric,
                 );
+            }
+        }
+    }
+}
+
+/// Check every optimizer-owned coordinate, not only the strongest coordinate in
+/// each family.  The original test above intentionally retains the strict
+/// `FD_MIN` non-vacuity gate for one representative per family.  Exhaustive
+/// coverage cannot impose that same magnitude on every coordinate: embedding
+/// rows absent from `IDS`, and coordinates whose contributions cancel, are
+/// mathematically allowed to be zero.  Every coordinate still uses the exact
+/// same central-difference step and `FD_ABS + FD_REL` error budget.
+#[test]
+fn every_trainable_coordinate_matches_finite_difference_with_populated_memory() {
+    for depth in [2, 4] {
+        let mut analytic = fixture(depth);
+        for layer in 0..depth {
+            assert_eq!(block(&analytic, layer).memory.count, 2,
+                "depth{depth}/layer{layer} exhaustive fixture memory must be populated");
+        }
+        analytic.forward_train_chunk(&IDS, &TARGETS);
+        analytic.zero_gradients();
+        analytic.backward_chunk(IDS.len(), 1.0);
+
+        for coordinate in 0..analytic.embed_w.data.len() {
+            let derivative = analytic.embed_w.grad[coordinate];
+            let original = analytic.embed_w.data[coordinate];
+            let numeric = numeric_shared(depth, true, coordinate, original);
+            assert_fd_match(&format!("depth{depth}/embed[{coordinate}]"), derivative, numeric);
+        }
+        for coordinate in 0..analytic.unembed_w.data.len() {
+            let derivative = analytic.unembed_w.grad[coordinate];
+            let original = analytic.unembed_w.data[coordinate];
+            let numeric = numeric_shared(depth, false, coordinate, original);
+            assert_fd_match(&format!("depth{depth}/head[{coordinate}]"), derivative, numeric);
+        }
+
+        for layer in 0..depth {
+            for family in FAMILIES {
+                let coordinates = family_data(block(&analytic, layer), family).len();
+                for coordinate in 0..coordinates {
+                    let (derivative, original) = {
+                        let current = block(&analytic, layer);
+                        (
+                            family_grad(current, family)[coordinate],
+                            family_data(current, family)[coordinate],
+                        )
+                    };
+                    let numeric = numeric_layer(depth, layer, family, coordinate, original);
+                    assert_fd_match(
+                        &format!("depth{depth}/layer{layer}/{family:?}[{coordinate}]"),
+                        derivative,
+                        numeric,
+                    );
+                }
             }
         }
     }
