@@ -37,7 +37,7 @@ fn schedule_has_positive_warmup_boundary_and_explicit_minimum() {
 #[test]
 fn zero_temperature_is_deterministic_and_permits_repeats() {
     let tok = Tokenizer::from_vocabulary(&["<unk>".into(), "alpha".into(), "beta".into()]).unwrap(); let mut m = PSSALayerV2::new(cfg(3), 1); m.vocabulary = tok.ordered_vocabulary().unwrap();
-    m.embed_w.data.fill(0.); m.a_mat.data.fill(0.); m.w_delta.data.fill(0.); m.w_b.data.fill(0.); m.w_c.data.fill(0.); m.w_qx.data.fill(0.); m.w_qh.data.fill(0.); m.w_gate.data.fill(0.); m.w_proj.data.fill(0.); m.mlp_w1.data.fill(0.); m.mlp_w2.data.fill(0.); m.unembed_w.data.fill(0.);
+    m.embed_w.data.fill(0.); m.block.a_mat.data.fill(0.); m.block.w_delta.data.fill(0.); m.block.w_b.data.fill(0.); m.block.w_c.data.fill(0.); m.block.w_qx.data.fill(0.); m.block.w_qh.data.fill(0.); m.block.w_gate.data.fill(0.); m.block.w_proj.data.fill(0.); m.block.mlp_w1.data.fill(0.); m.block.mlp_w2.data.fill(0.); m.unembed_w.data.fill(0.);
     let output = { let mut e = PSSAInferenceEngine::try_new(&mut m, &tok).unwrap(); e.try_generate_chat_turn("alpha", &InferenceConfig { temperature: 0.0, max_new_tokens: 3, ..Default::default() }, |_| {}).unwrap() };
     assert_eq!(output, "alpha alpha alpha");
 }
