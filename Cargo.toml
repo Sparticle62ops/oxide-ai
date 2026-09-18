@@ -18,7 +18,8 @@ bytemuck = { version = "1.16", features = ["derive"] }
 rayon = "1.10"
 tokenizers = { version = "0.22.1", default-features = false, features = ["fancy-regex"] }
 # Explicit direct use validates persisted tokenizer policy before model allocation.
-serde_json = "1.0"
+# Exact numeric round trips are required by persisted study provenance guards.
+serde_json = { version = "1.0", features = ["float_roundtrip"] }
 
 [profile.release]
 opt-level = 3
