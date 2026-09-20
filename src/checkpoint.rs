@@ -15,7 +15,7 @@
 
 use crate::adapter::PlasticAdapterV2;
 use crate::linalg::SimpleRng;
-use crate::pssa::{PSSAConfigV2, PSSALayerV2, ParamMatrix, ParamVector};
+use crate::pssa::{PSSAConfigV2, PSSAContinuousBlockV2, PSSALayerV2, ParamMatrix, ParamVector};
 use std::collections::HashSet;
 use std::fmt;
 use std::fs::{self, OpenOptions};
@@ -25,6 +25,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const FORMAT_VERSION: u16 = 7;
 pub const V6_FORMAT_VERSION: u16 = 6;
+pub const V8_FORMAT_VERSION: u16 = 8;
 const HEADER_LEN: usize = 22;
 const MAX_TOKENIZER_JSON_BYTES: usize = 16 * 1024 * 1024;
 const HEADER_V5_LEN: usize = 38;
@@ -56,6 +57,7 @@ type Result<T> = std::result::Result<T, CheckpointError>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckpointFormat {
+    V8,
     V7,
     V6,
     /// V5 lacks optimizer, recurrent, vocabulary, and memory metadata state.
@@ -210,6 +212,10 @@ fn allocation_bytes(c: &PSSAConfigV2) -> Result<usize> {
     )?;
     add_mul(&mut f32_count, cap, 2, "memory metadata")?;
     add_mul(&mut usize_count, cap, 1, "memory timestamps")?;
+    // Extraction-owned buffers absent from the legacy tape/scratch inventory:
+    // raw block input, three endpoint chunk buffers, and inference input.
+    add_mul(&mut f32_count, checked_mul(l, m, "continuous features")?, 4, "continuous chunk buffers")?;
+    add_mul(&mut f32_count, m, 1, "inference features")?;
     // Activation tape f32 arrays.
     for n in [
         checked_mul(l, m, "tape")?,
@@ -585,18 +591,18 @@ fn payload_for_v6(model: &PSSALayerV2) -> Result<Vec<u8>> {
     validate_config(&model.cfg)?;
     allocation_bytes(&model.cfg)?;
     validate_vocab(&model.vocabulary, model.cfg.d_vocab)?;
-    if model.adapters.len() != 1
-        || model.adapters[0].rank != 16
-        || model.adapters[0].d_latent != model.cfg.d_latent
+    if model.block.adapters.len() != 1
+        || model.block.adapters[0].rank != 16
+        || model.block.adapters[0].d_latent != model.cfg.d_latent
     {
         return Err(invalid("V6 requires exactly one rank-16 adapter"));
     }
-    if model.h_persistent.len()
+    if model.block.h_persistent.len()
         != checked_mul(model.cfg.d_latent, model.cfg.d_state, "h_persistent")?
     {
         return Err(invalid("h_persistent shape mismatch"));
     }
-    let mem = &model.memory;
+    let mem = &model.block.memory;
     if mem.capacity != model.cfg.mem_capacity
         || mem.dim_key != model.cfg.d_mem_key
         || mem.dim_val != model.cfg.d_latent
@@ -613,23 +619,23 @@ fn payload_for_v6(model: &PSSALayerV2) -> Result<Vec<u8>> {
     write_vocab(&mut w, &model.vocabulary, model.cfg.d_vocab)?;
     for (p, n) in [
         (&model.embed_w, "embed_w"),
-        (&model.a_mat, "a_mat_raw"),
-        (&model.w_delta, "w_delta"),
-        (&model.w_b, "w_b"),
-        (&model.w_c, "w_c"),
-        (&model.w_qx, "w_qx"),
-        (&model.w_qh, "w_qh"),
-        (&model.w_gate, "w_gate"),
-        (&model.w_proj, "w_proj"),
-        (&model.mlp_w1, "mlp_w1"),
-        (&model.mlp_w2, "mlp_w2"),
+        (&model.block.a_mat, "a_mat_raw"),
+        (&model.block.w_delta, "w_delta"),
+        (&model.block.w_b, "w_b"),
+        (&model.block.w_c, "w_c"),
+        (&model.block.w_qx, "w_qx"),
+        (&model.block.w_qh, "w_qh"),
+        (&model.block.w_gate, "w_gate"),
+        (&model.block.w_proj, "w_proj"),
+        (&model.block.mlp_w1, "mlp_w1"),
+        (&model.block.mlp_w2, "mlp_w2"),
         (&model.unembed_w, "unembed_w"),
     ] {
         write_matrix(&mut w, p, n)?;
     }
-    write_vector(&mut w, &model.norm_gamma, "norm_gamma")?;
-    write_vector(&mut w, &model.norm_beta, "norm_beta")?;
-    w.floats(&model.h_persistent, "h_persistent")?;
+    write_vector(&mut w, &model.block.norm_gamma, "norm_gamma")?;
+    write_vector(&mut w, &model.block.norm_beta, "norm_beta")?;
+    w.floats(&model.block.h_persistent, "h_persistent")?;
     w.usize(mem.count, "memory count")?;
     w.usize(mem.write_head, "memory write_head")?;
     w.floats(&mem.keys, "memory keys")?;
@@ -637,12 +643,72 @@ fn payload_for_v6(model: &PSSALayerV2) -> Result<Vec<u8>> {
     w.floats(&mem.norm_sq, "memory norm_sq")?;
     w.floats(&mem.confidence, "memory confidence")?;
     w.usizes(&mem.last_seen_step, "memory last_seen_step")?;
-    let ad = &model.adapters[0];
+    let ad = &model.block.adapters[0];
     write_matrix(&mut w, &ad.down_proj, "adapter.down")?;
     write_matrix(&mut w, &ad.up_proj, "adapter.up")?;
     w.floats(&ad.consolidated_up, "adapter.consolidated_up")?;
     w.usizes(&model.embed_row_marks, "embed_row_marks")?;
     Ok(w.bytes)
+}
+
+fn validate_block(block: &PSSAContinuousBlockV2, cfg: &PSSAConfigV2) -> Result<()> {
+    if block.adapters.len() != 1 || block.adapters[0].rank != 16 || block.adapters[0].d_latent != cfg.d_latent {
+        return Err(invalid("block requires exactly one rank-16 adapter"));
+    }
+    if block.h_persistent.len() != checked_mul(cfg.d_latent, cfg.d_state, "h_persistent")? {
+        return Err(invalid("block h_persistent shape mismatch"));
+    }
+    let mem=&block.memory;
+    if mem.capacity != cfg.mem_capacity || mem.dim_key != cfg.d_mem_key || mem.dim_val != cfg.d_latent || mem.count>mem.capacity || mem.write_head>=mem.capacity {
+        return Err(invalid("block memory dimensions or metadata invalid"));
+    }
+    if mem.keys.len() != checked_mul(mem.capacity, mem.dim_key, "memory keys")? || mem.values.len() != checked_mul(mem.capacity, mem.dim_val, "memory values")? || mem.norm_sq.len() != mem.capacity || mem.confidence.len() != mem.capacity || mem.last_seen_step.len() != mem.capacity || block.adapters[0].consolidated_up.len() != checked_mul(cfg.d_latent, 16, "adapter slow")? {
+        return Err(invalid("block memory or adapter storage shape mismatch"));
+    }
+    Ok(())
+}
+fn write_block_v8(w:&mut Writer, block:&PSSAContinuousBlockV2, cfg:&PSSAConfigV2, name:&str)->Result<()> {
+    validate_block(block,cfg)?;
+    for (p,n) in [(&block.a_mat,"a_mat_raw"),(&block.w_delta,"w_delta"),(&block.w_b,"w_b"),(&block.w_c,"w_c"),(&block.w_qx,"w_qx"),(&block.w_qh,"w_qh"),(&block.w_gate,"w_gate"),(&block.w_proj,"w_proj"),(&block.mlp_w1,"mlp_w1"),(&block.mlp_w2,"mlp_w2")] { write_matrix(w,p,&format!("{name}.{n}"))?; }
+    write_vector(w,&block.norm_gamma,&format!("{name}.norm_gamma"))?; write_vector(w,&block.norm_beta,&format!("{name}.norm_beta"))?;
+    w.floats(&block.h_persistent,&format!("{name}.h_persistent"))?;
+    let mem=&block.memory; w.usize(mem.count,&format!("{name}.memory count"))?; w.usize(mem.write_head,&format!("{name}.memory write_head"))?;
+    w.floats(&mem.keys,&format!("{name}.memory keys"))?; w.floats(&mem.values,&format!("{name}.memory values"))?; w.floats(&mem.norm_sq,&format!("{name}.memory norm_sq"))?; w.floats(&mem.confidence,&format!("{name}.memory confidence"))?; w.usizes(&mem.last_seen_step,&format!("{name}.memory last_seen_step"))?;
+    let ad=&block.adapters[0]; write_matrix(w,&ad.down_proj,&format!("{name}.adapter.down"))?; write_matrix(w,&ad.up_proj,&format!("{name}.adapter.up"))?; w.floats(&ad.consolidated_up,&format!("{name}.adapter.consolidated_up"))?;
+    Ok(())
+}
+fn read_block_v8(r:&mut Reader<'_>, block:&mut PSSAContinuousBlockV2, name:&str)->Result<()> {
+    for (p,n) in [(&mut block.a_mat,"a_mat_raw"),(&mut block.w_delta,"w_delta"),(&mut block.w_b,"w_b"),(&mut block.w_c,"w_c"),(&mut block.w_qx,"w_qx"),(&mut block.w_qh,"w_qh"),(&mut block.w_gate,"w_gate"),(&mut block.w_proj,"w_proj"),(&mut block.mlp_w1,"mlp_w1"),(&mut block.mlp_w2,"mlp_w2")] { read_matrix(r,p,&format!("{name}.{n}"))?; }
+    read_vector(r,&mut block.norm_gamma,&format!("{name}.norm_gamma"))?; read_vector(r,&mut block.norm_beta,&format!("{name}.norm_beta"))?;
+    block.h_persistent=r.floats(block.h_persistent.len(),&format!("{name}.h_persistent"),false)?;
+    let count=r.usize(&format!("{name}.memory count"))?; let head=r.usize(&format!("{name}.memory write_head"))?;
+    if count>block.memory.capacity || head>=block.memory.capacity { return Err(invalid("block memory count/write head invalid")); }
+    block.memory.count=count; block.memory.write_head=head;
+    block.memory.keys=r.floats(block.memory.keys.len(),&format!("{name}.memory keys"),false)?; block.memory.values=r.floats(block.memory.values.len(),&format!("{name}.memory values"),false)?; block.memory.norm_sq=r.floats(block.memory.norm_sq.len(),&format!("{name}.memory norm_sq"),true)?; block.memory.confidence=r.floats(block.memory.confidence.len(),&format!("{name}.memory confidence"),true)?; block.memory.last_seen_step=r.usizes(block.memory.last_seen_step.len(),&format!("{name}.memory last_seen_step"))?;
+    read_matrix(r,&mut block.adapters[0].down_proj,&format!("{name}.adapter.down"))?; read_matrix(r,&mut block.adapters[0].up_proj,&format!("{name}.adapter.up"))?; block.adapters[0].consolidated_up=r.floats(block.adapters[0].consolidated_up.len(),&format!("{name}.adapter.consolidated_up"),false)?;
+    Ok(())
+}
+fn validate_memory_block(block:&PSSAContinuousBlockV2, step:usize)->Result<()> {
+    let m=&block.memory;
+    if m.count>m.capacity || m.write_head>=m.capacity || (m.count<m.capacity && m.write_head!=0) { return Err(invalid("memory count/write head invalid")); }
+    for i in 0..m.capacity { if !m.confidence[i].is_finite() || m.confidence[i]<0.0 { return Err(invalid("memory confidence invalid")); }
+        if i<m.count { let key=&m.keys[i*m.dim_key..(i+1)*m.dim_key]; let sq=key_dot(key); let stored=m.norm_sq[i]; if !stored.is_finite()||stored<0.0||stored>=1.0||!sq.is_finite()||sq>=1.0||(stored-sq).abs()>2e-5*(1.0+sq.abs()) { return Err(invalid("memory norm_sq/key metadata invalid")); } if m.last_seen_step[i]>step{return Err(invalid("memory timestamp exceeds checkpoint step"));} }
+    } Ok(())
+}
+fn payload_for_v8(model:&PSSALayerV2)->Result<Vec<u8>> {
+    validate_config(&model.cfg)?; if model.depth()>PSSALayerV2::MAX_DEPTH { return Err(invalid("depth exceeds cap")); } validate_vocab(&model.vocabulary,model.cfg.d_vocab)?; validate_tokenizer_metadata(model)?;
+    if model.residual_scales.len()!=model.depth()-1 {return Err(invalid("residual scale count mismatch"));}
+    let expected=1.0/(model.depth() as f32).sqrt(); if model.residual_scales.iter().any(|x|!x.is_finite()||*x<=0.0||x.to_bits()!=expected.to_bits()) {return Err(invalid("invalid residual scale"));}
+    validate_block(&model.block,&model.cfg)?; validate_memory_block(&model.block,model.step_counter)?; for b in &model.extra_blocks {validate_block(b,&model.cfg)?;validate_memory_block(b,model.step_counter)?;}
+    let mut w=Writer::new(); config_to_payload(&mut w,&model.cfg)?; w.usize(model.depth(),"depth")?; w.floats(&model.residual_scales,"residual scales")?; w.usize(model.step_counter,"step_counter")?; w.u64(model.rng.state); write_vocab(&mut w,&model.vocabulary,model.cfg.d_vocab)?; write_matrix(&mut w,&model.embed_w,"embed_w")?; write_matrix(&mut w,&model.unembed_w,"unembed_w")?; write_block_v8(&mut w,&model.block,&model.cfg,"block0")?; for (i,b) in model.extra_blocks.iter().enumerate(){write_block_v8(&mut w,b,&model.cfg,&format!("block{}",i+1))?;} w.usizes(&model.embed_row_marks,"embed_row_marks")?;
+    if let Some(json)=&model.tokenizer_json {w.usize(json.len(),"tokenizer JSON length")?;w.bytes.extend_from_slice(json.as_bytes());}else{w.usize(0,"tokenizer JSON length")?;} Ok(w.bytes)
+}
+fn load_v8_payload(payload:&[u8])->Result<LoadedCheckpoint> {
+    let mut r=Reader::new(payload); let cfg=config_from_payload(&mut r)?; let depth=r.usize("depth")?; if !(1..=PSSALayerV2::MAX_DEPTH).contains(&depth){return Err(invalid("depth outside supported range"));}
+    // Verify count and fixed values before creating a model or allocating any layer.
+    let scales=r.floats(depth-1,"residual scales",false)?; let expected=1.0/(depth as f32).sqrt(); if scales.iter().any(|x|*x<=0.0||x.to_bits()!=expected.to_bits()){return Err(invalid("invalid residual scale"));}
+    let per=allocation_bytes(&cfg)?; let allocated=checked_mul(per,depth,"stacked allocation")?; if allocated>MAX_LOAD_ALLOCATION_BYTES{return Err(invalid("stacked model exceeds allocation cap"));} let backed=payload.len().saturating_mul(128); if allocated>backed{return Err(invalid("declared stacked allocation disproportionate to checkpoint data"));}
+    let step=r.usize("step_counter")?; let rng_state=r.u64("rng state")?; let vocabulary=read_vocab(&mut r,cfg.d_vocab)?; let mut model=PSSALayerV2::new_with_depth(cfg,1,depth); model.step_counter=step; model.rng=SimpleRng::new(rng_state);model.rng.state=rng_state;model.residual_scales=scales; read_matrix(&mut r,&mut model.embed_w,"embed_w")?;read_matrix(&mut r,&mut model.unembed_w,"unembed_w")?;read_block_v8(&mut r,&mut model.block,"block0")?;for (i,b) in model.extra_blocks.iter_mut().enumerate(){read_block_v8(&mut r,b,&format!("block{}",i+1))?;} model.embed_row_marks=r.usizes(model.embed_row_marks.len(),"embed_row_marks")?;model.vocabulary=vocabulary;let json_len=r.usize("tokenizer JSON length")?;if json_len>MAX_TOKENIZER_JSON_BYTES{return Err(invalid("tokenizer JSON exceeds 16 MiB cap"));}model.tokenizer_json=if json_len==0{None}else{Some(std::str::from_utf8(r.take(json_len,"tokenizer JSON")?).map_err(|_|invalid("tokenizer JSON is not UTF-8"))?.to_string())};r.done()?;validate_tokenizer_metadata(&model)?;validate_memory_block(&model.block,model.step_counter)?;for b in &model.extra_blocks{validate_memory_block(b,model.step_counter)?;}Ok(LoadedCheckpoint{model,format:CheckpointFormat::V8})
 }
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -686,23 +752,17 @@ fn container_bytes(version: u16, payload: Vec<u8>) -> Result<Vec<u8>> {
 
 /// Writes the current V7 format. It preserves all V6 state plus tokenizer metadata.
 pub fn save_model(model: &PSSALayerV2, path: impl AsRef<Path>) -> Result<()> {
+    if model.depth() > 1 { return atomic_write(path.as_ref(), &container_bytes(V8_FORMAT_VERSION, payload_for_v8(model)?)?); }
     validate_tokenizer_metadata(model)?;
     let mut payload = payload_for_v6(model)?;
-    if let Some(json) = &model.tokenizer_json {
-        payload.extend_from_slice(
-            &(u64::try_from(json.len()).map_err(|_| invalid("tokenizer JSON too large"))?)
-                .to_le_bytes(),
-        );
-        payload.extend_from_slice(json.as_bytes());
-    } else {
-        payload.extend_from_slice(&0u64.to_le_bytes());
-    }
+    if let Some(json) = &model.tokenizer_json { payload.extend_from_slice(&(u64::try_from(json.len()).map_err(|_| invalid("tokenizer JSON too large"))?).to_le_bytes()); payload.extend_from_slice(json.as_bytes()); } else { payload.extend_from_slice(&0u64.to_le_bytes()); }
     atomic_write(path.as_ref(), &container_bytes(FORMAT_VERSION, payload)?)
 }
 
 /// Compatibility writer for explicitly requested V6 word checkpoints. It cannot
 /// serialize BPE metadata; use `save_model` for all new checkpoints.
 pub fn save_model_v6(model: &PSSALayerV2, path: impl AsRef<Path>) -> Result<()> {
+    if model.depth() != 1 { return Err(invalid("V6 cannot serialize stacked models")); }
     if model.tokenizer_json.is_some() {
         return Err(invalid(
             "V6 cannot serialize byte-level tokenizer metadata; use V7",
@@ -727,7 +787,7 @@ fn read_file_capped(path: &Path) -> Result<Vec<u8>> {
 }
 
 fn validate_memory(model: &PSSALayerV2) -> Result<()> {
-    let m = &model.memory;
+    let m = &model.block.memory;
     if m.count > m.capacity
         || m.write_head >= m.capacity
         || (m.count < m.capacity && m.write_head != 0)
@@ -796,40 +856,40 @@ fn load_payload(payload: &[u8], is_v7: bool) -> Result<LoadedCheckpoint> {
     model.rng.state = rng_state;
     for (p, n) in [
         (&mut model.embed_w, "embed_w"),
-        (&mut model.a_mat, "a_mat_raw"),
-        (&mut model.w_delta, "w_delta"),
-        (&mut model.w_b, "w_b"),
-        (&mut model.w_c, "w_c"),
-        (&mut model.w_qx, "w_qx"),
-        (&mut model.w_qh, "w_qh"),
-        (&mut model.w_gate, "w_gate"),
-        (&mut model.w_proj, "w_proj"),
-        (&mut model.mlp_w1, "mlp_w1"),
-        (&mut model.mlp_w2, "mlp_w2"),
+        (&mut model.block.a_mat, "a_mat_raw"),
+        (&mut model.block.w_delta, "w_delta"),
+        (&mut model.block.w_b, "w_b"),
+        (&mut model.block.w_c, "w_c"),
+        (&mut model.block.w_qx, "w_qx"),
+        (&mut model.block.w_qh, "w_qh"),
+        (&mut model.block.w_gate, "w_gate"),
+        (&mut model.block.w_proj, "w_proj"),
+        (&mut model.block.mlp_w1, "mlp_w1"),
+        (&mut model.block.mlp_w2, "mlp_w2"),
         (&mut model.unembed_w, "unembed_w"),
     ] {
         read_matrix(&mut r, p, n)?;
     }
-    read_vector(&mut r, &mut model.norm_gamma, "norm_gamma")?;
-    read_vector(&mut r, &mut model.norm_beta, "norm_beta")?;
-    model.h_persistent = r.floats(model.h_persistent.len(), "h_persistent", false)?;
+    read_vector(&mut r, &mut model.block.norm_gamma, "norm_gamma")?;
+    read_vector(&mut r, &mut model.block.norm_beta, "norm_beta")?;
+    model.block.h_persistent = r.floats(model.block.h_persistent.len(), "h_persistent", false)?;
     let count = r.usize("memory count")?;
     let head = r.usize("memory write_head")?;
-    if count > model.memory.capacity || head >= model.memory.capacity {
+    if count > model.block.memory.capacity || head >= model.block.memory.capacity {
         return Err(invalid("memory count/write head invalid"));
     }
-    model.memory.count = count;
-    model.memory.write_head = head;
-    model.memory.keys = r.floats(model.memory.keys.len(), "memory keys", false)?;
-    model.memory.values = r.floats(model.memory.values.len(), "memory values", false)?;
-    model.memory.norm_sq = r.floats(model.memory.norm_sq.len(), "memory norm_sq", true)?;
-    model.memory.confidence = r.floats(model.memory.confidence.len(), "memory confidence", true)?;
-    model.memory.last_seen_step =
-        r.usizes(model.memory.last_seen_step.len(), "memory last_seen_step")?;
-    read_matrix(&mut r, &mut model.adapters[0].down_proj, "adapter.down")?;
-    read_matrix(&mut r, &mut model.adapters[0].up_proj, "adapter.up")?;
-    model.adapters[0].consolidated_up = r.floats(
-        model.adapters[0].consolidated_up.len(),
+    model.block.memory.count = count;
+    model.block.memory.write_head = head;
+    model.block.memory.keys = r.floats(model.block.memory.keys.len(), "memory keys", false)?;
+    model.block.memory.values = r.floats(model.block.memory.values.len(), "memory values", false)?;
+    model.block.memory.norm_sq = r.floats(model.block.memory.norm_sq.len(), "memory norm_sq", true)?;
+    model.block.memory.confidence = r.floats(model.block.memory.confidence.len(), "memory confidence", true)?;
+    model.block.memory.last_seen_step =
+        r.usizes(model.block.memory.last_seen_step.len(), "memory last_seen_step")?;
+    read_matrix(&mut r, &mut model.block.adapters[0].down_proj, "adapter.down")?;
+    read_matrix(&mut r, &mut model.block.adapters[0].up_proj, "adapter.up")?;
+    model.block.adapters[0].consolidated_up = r.floats(
+        model.block.adapters[0].consolidated_up.len(),
         "adapter.consolidated_up",
         false,
     )?;
@@ -941,9 +1001,9 @@ fn load_v5(bytes: &[u8]) -> Result<LoadedCheckpoint> {
     }
     let mut model = PSSALayerV2::new(cfg, 42);
     model.embed_w.data = legacy_slice(&mut r, model.embed_w.data.len(), "embed_w")?;
-    model.norm_gamma.data = legacy_slice(&mut r, model.norm_gamma.data.len(), "norm_gamma")?;
-    model.norm_beta.data = legacy_slice(&mut r, model.norm_beta.data.len(), "norm_beta")?;
-    let physical = legacy_slice(&mut r, model.a_mat.data.len(), "a_mat physical")?;
+    model.block.norm_gamma.data = legacy_slice(&mut r, model.block.norm_gamma.data.len(), "norm_gamma")?;
+    model.block.norm_beta.data = legacy_slice(&mut r, model.block.norm_beta.data.len(), "norm_beta")?;
+    let physical = legacy_slice(&mut r, model.block.a_mat.data.len(), "a_mat physical")?;
     let mut bad = 0usize;
     for &a in &physical {
         if !a.is_finite() || a >= 0.0 {
@@ -955,17 +1015,17 @@ fn load_v5(bytes: &[u8]) -> Result<LoadedCheckpoint> {
             "legacy physical A contains {bad} nonfinite or nonnegative entries; refusing unsafe conversion"
         )));
     }
-    model.a_mat.data = physical.into_iter().map(|a| inverse_softplus(-a)).collect();
+    model.block.a_mat.data = physical.into_iter().map(|a| inverse_softplus(-a)).collect();
     for (slot, name) in [
-        (&mut model.w_delta, "w_delta"),
-        (&mut model.w_b, "w_b"),
-        (&mut model.w_c, "w_c"),
-        (&mut model.w_qx, "w_qx"),
-        (&mut model.w_qh, "w_qh"),
-        (&mut model.w_gate, "w_gate"),
-        (&mut model.w_proj, "w_proj"),
-        (&mut model.mlp_w1, "mlp_w1"),
-        (&mut model.mlp_w2, "mlp_w2"),
+        (&mut model.block.w_delta, "w_delta"),
+        (&mut model.block.w_b, "w_b"),
+        (&mut model.block.w_c, "w_c"),
+        (&mut model.block.w_qx, "w_qx"),
+        (&mut model.block.w_qh, "w_qh"),
+        (&mut model.block.w_gate, "w_gate"),
+        (&mut model.block.w_proj, "w_proj"),
+        (&mut model.block.mlp_w1, "mlp_w1"),
+        (&mut model.block.mlp_w2, "mlp_w2"),
         (&mut model.unembed_w, "unembed_w"),
     ] {
         slot.data = legacy_slice(&mut r, slot.data.len(), name)?;
@@ -974,32 +1034,32 @@ fn load_v5(bytes: &[u8]) -> Result<LoadedCheckpoint> {
     let v_len = checked_mul(mem_count, model.cfg.d_latent, "legacy values")?;
     let keys = legacy_slice(&mut r, k_len, "memory keys")?;
     let vals = legacy_slice(&mut r, v_len, "memory values")?;
-    model.memory.keys[..k_len].copy_from_slice(&keys);
-    model.memory.values[..v_len].copy_from_slice(&vals);
-    model.memory.count = mem_count;
-    model.memory.write_head = mem_count % model.memory.capacity;
+    model.block.memory.keys[..k_len].copy_from_slice(&keys);
+    model.block.memory.values[..v_len].copy_from_slice(&vals);
+    model.block.memory.count = mem_count;
+    model.block.memory.write_head = mem_count % model.block.memory.capacity;
     for i in 0..mem_count {
         let sq =
-            key_dot(&model.memory.keys[i * model.cfg.d_mem_key..(i + 1) * model.cfg.d_mem_key]);
+            key_dot(&model.block.memory.keys[i * model.cfg.d_mem_key..(i + 1) * model.cfg.d_mem_key]);
         if !sq.is_finite() || sq >= 1.0 {
             return Err(invalid(format!(
                 "legacy memory key {i} is outside the open Poincare ball"
             )));
         }
-        model.memory.norm_sq[i] = sq;
+        model.block.memory.norm_sq[i] = sq;
     }
     let rank = legacy_u32(&mut r, "adapter rank")?;
     if rank != 16 {
         return Err(invalid(format!("legacy adapter rank {rank}; expected 16")));
     }
-    model.adapters[0] = PlasticAdapterV2::new(model.cfg.d_latent, 16, &mut model.rng);
-    model.adapters[0].down_proj.data = legacy_slice(
+    model.block.adapters[0] = PlasticAdapterV2::new(model.cfg.d_latent, 16, &mut model.rng);
+    model.block.adapters[0].down_proj.data = legacy_slice(
         &mut r,
-        model.adapters[0].down_proj.data.len(),
+        model.block.adapters[0].down_proj.data.len(),
         "adapter down",
     )?;
-    model.adapters[0].up_proj.data =
-        legacy_slice(&mut r, model.adapters[0].up_proj.data.len(), "adapter up")?;
+    model.block.adapters[0].up_proj.data =
+        legacy_slice(&mut r, model.block.adapters[0].up_proj.data.len(), "adapter up")?;
     r.done()?;
     Ok(LoadedCheckpoint {
         model,
@@ -1016,6 +1076,7 @@ pub fn load_checkpoint(path: impl AsRef<Path>) -> Result<LoadedCheckpoint> {
     }
     let version = u16::from_le_bytes(bytes[4..6].try_into().expect("sized"));
     match version {
+        V8_FORMAT_VERSION => load_v8_payload(checked_payload(&bytes, "V8")?),
         FORMAT_VERSION => load_v7(&bytes),
         V6_FORMAT_VERSION => load_v6(&bytes),
         5 => load_v5(&bytes),

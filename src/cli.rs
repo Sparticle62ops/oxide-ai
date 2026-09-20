@@ -3,7 +3,10 @@ use crate::dataset::{DatasetManager, Tokenizer, TokenizerKind};
 use crate::inference::{InferenceConfig, PSSAInferenceEngine};
 use crate::pssa::{PSSAConfigV2, PSSALayerV2};
 use std::collections::{HashMap, HashSet};
+use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 #[derive(Clone, Debug)]
@@ -128,6 +131,230 @@ impl Parsed {
     }
 }
 
+trait TrainingObserver {
+    fn initialized(
+        &mut self,
+        model: &PSSALayerV2,
+        tokenizer: &Tokenizer,
+        options: &TrainingOptions,
+    ) -> Result<(), String>;
+    fn epoch(
+        &mut self,
+        model: &PSSALayerV2,
+        tokenizer: &Tokenizer,
+        options: &TrainingOptions,
+        epoch: usize,
+        cross_entropy: f64,
+        scored_transitions: usize,
+        last_lr: f32,
+        elapsed_seconds: f32,
+    ) -> Result<(), String>;
+}
+
+struct NoopTrainingObserver;
+impl TrainingObserver for NoopTrainingObserver {
+    fn initialized(
+        &mut self,
+        _model: &PSSALayerV2,
+        _tokenizer: &Tokenizer,
+        _options: &TrainingOptions,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn epoch(
+        &mut self,
+        _model: &PSSALayerV2,
+        _tokenizer: &Tokenizer,
+        _options: &TrainingOptions,
+        _epoch: usize,
+        _cross_entropy: f64,
+        _scored_transitions: usize,
+        _last_lr: f32,
+        _elapsed_seconds: f32,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+static ARTIFACT_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn atomic_artifact_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let stem = path
+        .file_name()
+        .and_then(|x| x.to_str())
+        .unwrap_or("artifact");
+    let nonce = ARTIFACT_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp = parent.join(format!(".{stem}.{}.{}.tmp", std::process::id(), nonce));
+    // Do not remove a file we did not create if a name collision occurs.
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .map_err(|e| format!("cannot create temporary artifact '{}': {e}", tmp.display()))?;
+    let result = (|| -> io::Result<()> {
+        file.write_all(bytes)?;
+        file.flush()?;
+        file.sync_all()?;
+        fs::rename(&tmp, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result.map_err(|e| format!("cannot atomically write artifact '{}': {e}", path.display()))
+}
+
+struct ArtifactTrainingObserver {
+    run_dir: PathBuf,
+    data: String,
+    output: String,
+    metrics: Vec<serde_json::Value>,
+}
+
+impl ArtifactTrainingObserver {
+    fn new(run_dir: &Path, data: &str, output: &str) -> Self {
+        Self {
+            run_dir: run_dir.to_path_buf(),
+            data: data.to_string(),
+            output: output.to_string(),
+            metrics: Vec::new(),
+        }
+    }
+
+    fn checkpoint_path(&self, epoch: usize) -> PathBuf {
+        self.run_dir.join(format!("epoch-{epoch:04}.pssa"))
+    }
+
+    fn save_checkpoint(&self, model: &PSSALayerV2, epoch: usize) -> Result<(), String> {
+        let path = self.checkpoint_path(epoch);
+        checkpoint::save_model(model, &path)
+            .map_err(|e| format!("cannot save artifact checkpoint '{}': {e}", path.display()))
+    }
+
+    fn write_metrics(&self) -> Result<(), String> {
+        let path = self.run_dir.join("metrics.json");
+        let bytes = serde_json::to_vec_pretty(&self.metrics)
+            .map_err(|e| format!("cannot encode artifact metrics '{}': {e}", path.display()))?;
+        atomic_artifact_write(&path, &bytes)
+    }
+
+    fn add_metric(
+        &mut self,
+        epoch: usize,
+        cross_entropy: Option<f64>,
+        scored_transitions: usize,
+        updates: usize,
+        last_lr: Option<f32>,
+        elapsed_seconds: f32,
+    ) -> Result<(), String> {
+        self.metrics.push(serde_json::json!({
+            "epoch": epoch,
+            "cross_entropy": cross_entropy,
+            "scored_transitions": scored_transitions,
+            "optimizer_updates": updates,
+            "last_lr": last_lr,
+            "elapsed_seconds": elapsed_seconds,
+            "checkpoint": self.checkpoint_path(epoch).file_name().and_then(|x| x.to_str()).unwrap_or_default(),
+        }));
+        self.write_metrics()
+    }
+}
+
+impl TrainingObserver for ArtifactTrainingObserver {
+    fn initialized(
+        &mut self,
+        model: &PSSALayerV2,
+        tokenizer: &Tokenizer,
+        options: &TrainingOptions,
+    ) -> Result<(), String> {
+        let tokenizer_kind = match tokenizer.kind() {
+            TokenizerKind::Word => "word",
+            TokenizerKind::Bpe => "bpe",
+        };
+        let run_path = self.run_dir.join("run.json");
+        let run = serde_json::json!({
+            "schema_version": 1,
+            "data_source": &self.data,
+            "final_output": &self.output,
+            "configuration": {
+                "epochs": options.epochs,
+                "latent": options.latent,
+                "state": options.state,
+                "key": options.key,
+                "memory": options.memory,
+                "chunk": options.chunk,
+                "lr": options.lr,
+                "accumulate": options.accumulate,
+                "warmup_steps": options.warmup_steps,
+                "seed": options.seed,
+                "max_tokens": options.max_tokens,
+                "tokenizer": tokenizer_kind,
+                "vocab_size": options.vocab_size,
+            },
+            "model": {
+                "d_vocab": model.cfg.d_vocab,
+                "d_latent": model.cfg.d_latent,
+                "d_state": model.cfg.d_state,
+                "d_mem_key": model.cfg.d_mem_key,
+                "mem_capacity": model.cfg.mem_capacity,
+                "chunk_len": model.cfg.chunk_len,
+            },
+            "seed": options.seed,
+            "tokenizer": {
+                "kind": tokenizer_kind,
+                "vocabulary_size": tokenizer.vocab_size,
+                "fit_scope": "tokenizer fitted on all supplied training text",
+            },
+            "scope": {
+                "tokenizer": "tokenizer fitted on all supplied training text",
+                "max_tokens": "encoded training prefix per epoch, actual transitions lower",
+            },
+            "state_policy": "recurrent state resets at each epoch and document; episodic memory persists across documents and epochs",
+            "memory_policy": "episodic memory is retained in each checkpoint and is not cleared by recurrent-state resets",
+            "resume": {
+                "supported": false,
+                "note": "epoch checkpoints are evidence artifacts; the CLI provides no resume support",
+            },
+        });
+        let bytes = serde_json::to_vec_pretty(&run).map_err(|e| {
+            format!(
+                "cannot encode run configuration '{}': {e}",
+                run_path.display()
+            )
+        })?;
+        atomic_artifact_write(&run_path, &bytes)?;
+        self.save_checkpoint(model, 0)?;
+        self.add_metric(0, None, 0, model.step_counter, None, 0.0)
+    }
+
+    fn epoch(
+        &mut self,
+        model: &PSSALayerV2,
+        _tokenizer: &Tokenizer,
+        _options: &TrainingOptions,
+        epoch: usize,
+        cross_entropy: f64,
+        scored_transitions: usize,
+        last_lr: f32,
+        elapsed_seconds: f32,
+    ) -> Result<(), String> {
+        self.save_checkpoint(model, epoch)?;
+        self.add_metric(
+            epoch,
+            Some(cross_entropy),
+            scored_transitions,
+            model.step_counter,
+            Some(last_lr),
+            elapsed_seconds,
+        )
+    }
+}
+
 pub struct CLIHandler;
 impl CLIHandler {
     fn default_data() -> String {
@@ -218,30 +445,20 @@ impl CLIHandler {
             Ok(docs)
         }
     }
-    fn finite(model: &PSSALayerV2) -> bool {
-        [
-            &model.embed_w.data,
-            &model.a_mat.data,
-            &model.w_delta.data,
-            &model.w_b.data,
-            &model.w_c.data,
-            &model.w_qx.data,
-            &model.w_qh.data,
-            &model.w_gate.data,
-            &model.w_proj.data,
-            &model.mlp_w1.data,
-            &model.mlp_w2.data,
-            &model.unembed_w.data,
-            &model.norm_gamma.data,
-            &model.norm_beta.data,
-        ]
-        .iter()
-        .all(|x| x.iter().all(|v| v.is_finite()))
-    }
+    fn finite(model: &PSSALayerV2) -> bool { model.all_parameters_finite() }
 
     pub fn train_corpus(
         raw: &str,
         options: &TrainingOptions,
+    ) -> Result<(PSSALayerV2, Tokenizer), String> {
+        let mut observer = NoopTrainingObserver;
+        Self::train_corpus_with_observer(raw, options, &mut observer)
+    }
+
+    fn train_corpus_with_observer(
+        raw: &str,
+        options: &TrainingOptions,
+        observer: &mut dyn TrainingObserver,
     ) -> Result<(PSSALayerV2, Tokenizer), String> {
         let tokenizer = match options.tokenizer {
             TokenizerKind::Word => Tokenizer::from_corpus(raw, true),
@@ -285,7 +502,9 @@ impl CLIHandler {
             ));
         }
         let started = Instant::now();
+        observer.initialized(&model, &tokenizer, options)?;
         let mut update = 0;
+        let mut last_lr = 0.0f32;
         for epoch in 0..options.epochs {
             model.reset_recurrent_state();
             let mut loss_sum = 0.0f64;
@@ -304,46 +523,50 @@ impl CLIHandler {
                     let target = &docs[doc_id][start + 1..start + 1 + len];
                     let loss = model.forward_train_chunk(input, target);
                     if !loss.is_finite() {
-                        return Err("non-finite loss; training aborted without checkpoint".into());
+                        return Err("non-finite loss; training aborted; any completed epoch artifacts remain available".into());
                     }
                     model.backward_chunk(len, len as f32 / total_tokens as f32);
-                    if loss > 3.5 {
-                        let last = len - 1;
-                        let q = &model.tape.q_poincare
-                            [last * model.cfg.d_mem_key..(last + 1) * model.cfg.d_mem_key];
-                        let v = &model.tape.z_final
-                            [last * model.cfg.d_latent..(last + 1) * model.cfg.d_latent];
-                        model
-                            .memory
-                            .insert_protected(q, v, loss, model.step_counter);
-                    }
+                    model.insert_training_memory(loss, len);
                     loss_sum += loss as f64 * len as f64;
                     token_sum += len;
                 }
                 update += 1;
-                model.apply_adamw(learning_rate_for_update(
+                last_lr = learning_rate_for_update(
                     options.lr,
                     update,
                     total_updates,
                     options.warmup_steps,
-                )?);
+                )?;
+                model.apply_adamw(last_lr);
                 if !Self::finite(&model) {
-                    return Err("non-finite parameters; training aborted without checkpoint".into());
+                    return Err("non-finite parameters; training aborted; any completed epoch artifacts remain available".into());
                 }
             }
             model.ema_consolidate_plasticity();
+            let cross_entropy = loss_sum / token_sum.max(1) as f64;
             println!(
                 "epoch {}/{} loss={:.6} tokens={} updates={}",
                 epoch + 1,
                 options.epochs,
-                loss_sum / token_sum.max(1) as f64,
+                cross_entropy,
                 token_sum,
                 update
             );
+            observer.epoch(
+                &model,
+                &tokenizer,
+                options,
+                epoch + 1,
+                cross_entropy,
+                token_sum,
+                last_lr,
+                started.elapsed().as_secs_f32(),
+            )?;
         }
         println!(
-            "training_seconds={:.3} optimizer_updates={update}",
-            started.elapsed().as_secs_f32()
+            "training_seconds={:.3} optimizer_updates={}",
+            started.elapsed().as_secs_f32(),
+            update
         );
         Ok((model, tokenizer))
     }
@@ -351,6 +574,47 @@ impl CLIHandler {
     pub fn run_training(data: &str, options: &TrainingOptions, out: &str) -> Result<(), String> {
         let raw = DatasetManager::try_load_dataset(Some(data))?;
         let (model, _) = Self::train_corpus(&raw, options)?;
+        Self::save_model_v2(&model, out)
+            .map_err(|e| format!("cannot save checkpoint '{out}': {e}"))?;
+        println!("saved_checkpoint={out}");
+        Ok(())
+    }
+
+    fn run_training_with_artifacts(
+        data: &str,
+        options: &TrainingOptions,
+        out: &str,
+        run_dir: &str,
+    ) -> Result<(), String> {
+        let run_path = Path::new(run_dir);
+        if run_path.exists() {
+            return Err(format!(
+                "run directory '{}' already exists; --run-dir refuses reuse",
+                run_path.display()
+            ));
+        }
+        fs::create_dir(run_path).map_err(|e| {
+            format!(
+                "cannot create new run directory '{}': {e}",
+                run_path.display()
+            )
+        })?;
+        let output = Path::new(out);
+        let output_parent = output
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let output_name = output.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        let reserved = matches!(output_name, "run.json" | "metrics.json")
+            || (output_name.starts_with("epoch-") && output_name.ends_with(".pssa"));
+        if reserved && output_parent.canonicalize().ok() == run_path.canonicalize().ok() {
+            return Err(format!(
+                "final output '{out}' conflicts with a reserved run artifact"
+            ));
+        }
+        let raw = DatasetManager::try_load_dataset(Some(data))?;
+        let mut observer = ArtifactTrainingObserver::new(run_path, data, out);
+        let (model, _) = Self::train_corpus_with_observer(&raw, options, &mut observer)?;
         Self::save_model_v2(&model, out)
             .map_err(|e| format!("cannot save checkpoint '{out}': {e}"))?;
         println!("saved_checkpoint={out}");
@@ -385,7 +649,7 @@ impl CLIHandler {
             .map_err(|e| format!("cannot load model '{model_path}': {e}"))?;
         let model = loaded.model;
         match loaded.format {
-            CheckpointFormat::V7 => match &model.tokenizer_json {
+            CheckpointFormat::V8 | CheckpointFormat::V7 => match &model.tokenizer_json {
                 Some(json) => {
                     if data.is_some() {
                         return Err("--data is legacy word provenance only; V7 BPE checkpoints restore their embedded tokenizer and never retrain it".into());
@@ -586,7 +850,7 @@ impl CLIHandler {
     }
     pub fn print_help() {
         println!(
-            "Usage: oxide <command> [options]\nCommands: train, generate, evaluate, chat, download, benchmark\ntrain [source] [-d|--data source] [-o|--out path] [--tokenizer bpe|word --vocab-size 2048] [-e|--epochs n] [--latent n --state n --key n --memory n --chunk n --lr f --accumulate n --warmup-steps n --seed n --max-tokens n]\ngenerate <prompt> [-p|--prompt text] [-m|--model path] [-d|--data source] [-t|--temp f] [--max-new-tokens n]\nevaluate -m|--model path -d|--data source\nDefault training is byte-level BPE (2048 maximum vocabulary). --data is only a legacy-word provenance check for generation; V7 BPE restores embedded tokenizer metadata. --max-tokens is a global training-corpus cap."
+            "Usage: oxide <command> [options]\nCommands: train, generate, evaluate, chat, download, benchmark\ntrain [source] [-d|--data source] [-o|--out path] [--run-dir path] [--tokenizer bpe|word --vocab-size 2048] [-e|--epochs n] [--latent n --state n --key n --memory n --chunk n --lr f --accumulate n --warmup-steps n --seed n --max-tokens n]\ngenerate <prompt> [-p|--prompt text] [-m|--model path] [-d|--data source] [-t|--temp f] [--max-new-tokens n]\nevaluate -m|--model path -d|--data source\nDefault training is byte-level BPE (2048 maximum vocabulary). --data is only a legacy-word provenance check for generation; V7 BPE restores embedded tokenizer metadata. --max-tokens caps the encoded training prefix reused per epoch, not tokenizer fitting or the total across epochs. --run-dir must name a new directory and writes epoch checkpoints plus run.json and metrics.json; it does not enable CLI resume."
         );
     }
     pub fn parse_and_execute(args: Vec<String>) -> Result<(), String> {
@@ -607,6 +871,7 @@ impl CLIHandler {
                         "-d",
                         "--out",
                         "-o",
+                        "--run-dir",
                         "--epochs",
                         "-e",
                         "--latent",
@@ -632,7 +897,12 @@ impl CLIHandler {
                     .or_else(|| p.positional.first().cloned())
                     .unwrap_or_else(Self::default_data);
                 let out = p.string("--out", "-o").unwrap_or("data/model.pssa");
-                Self::run_training(&data, &Self::options(&p)?, out)
+                let options = Self::options(&p)?;
+                if let Some(run_dir) = p.string("--run-dir", "") {
+                    Self::run_training_with_artifacts(&data, &options, out, run_dir)
+                } else {
+                    Self::run_training(&data, &options, out)
+                }
             }
             "generate" => {
                 let p = Parsed::parse(

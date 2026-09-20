@@ -50,16 +50,16 @@ fn model() -> PSSALayerV2 {
     ];
     for (i, p) in [
         &mut x.embed_w,
-        &mut x.a_mat,
-        &mut x.w_delta,
-        &mut x.w_b,
-        &mut x.w_c,
-        &mut x.w_qx,
-        &mut x.w_qh,
-        &mut x.w_gate,
-        &mut x.w_proj,
-        &mut x.mlp_w1,
-        &mut x.mlp_w2,
+        &mut x.block.a_mat,
+        &mut x.block.w_delta,
+        &mut x.block.w_b,
+        &mut x.block.w_c,
+        &mut x.block.w_qx,
+        &mut x.block.w_qh,
+        &mut x.block.w_gate,
+        &mut x.block.w_proj,
+        &mut x.block.mlp_w1,
+        &mut x.block.mlp_w2,
         &mut x.unembed_w,
     ]
     .into_iter()
@@ -67,12 +67,12 @@ fn model() -> PSSALayerV2 {
     {
         pm(p, i as f32 + 0.1)
     }
-    pv(&mut x.norm_gamma, 20.);
-    pv(&mut x.norm_beta, 30.);
-    pm(&mut x.adapters[0].down_proj, 40.);
-    pm(&mut x.adapters[0].up_proj, 50.);
-    fill(&mut x.adapters[0].consolidated_up, 0.06);
-    fill(&mut x.h_persistent, 0.07);
+    pv(&mut x.block.norm_gamma, 20.);
+    pv(&mut x.block.norm_beta, 30.);
+    pm(&mut x.block.adapters[0].down_proj, 40.);
+    pm(&mut x.block.adapters[0].up_proj, 50.);
+    fill(&mut x.block.adapters[0].consolidated_up, 0.06);
+    fill(&mut x.block.h_persistent, 0.07);
     x.step_counter = 11;
     x.rng.state = 0x1234_5678_9abc_def0;
     for (k, v) in [
@@ -81,10 +81,10 @@ fn model() -> PSSALayerV2 {
         ([0.3, 0.1], [3., 4., 5., 6.]),
         ([0.1, 0.3], [4., 5., 6., 7.]),
     ] {
-        x.memory.insert(&k, &v);
+        x.block.memory.insert(&k, &v);
     }
-    x.memory.confidence.copy_from_slice(&[1.5, 2., 2.5]);
-    x.memory.last_seen_step.copy_from_slice(&[1, 2, 3]);
+    x.block.memory.confidence.copy_from_slice(&[1.5, 2., 2.5]);
+    x.block.memory.last_seen_step.copy_from_slice(&[1, 2, 3]);
     x.embed_row_marks.copy_from_slice(&[5, 4, 3, 2, 1]);
     x
 }
@@ -119,45 +119,45 @@ fn state(a: &PSSALayerV2, b: &PSSALayerV2) {
     assert_eq!(a.vocabulary, b.vocabulary);
     for (x, y) in [
         (&a.embed_w, &b.embed_w),
-        (&a.a_mat, &b.a_mat),
-        (&a.w_delta, &b.w_delta),
-        (&a.w_b, &b.w_b),
-        (&a.w_c, &b.w_c),
-        (&a.w_qx, &b.w_qx),
-        (&a.w_qh, &b.w_qh),
-        (&a.w_gate, &b.w_gate),
-        (&a.w_proj, &b.w_proj),
-        (&a.mlp_w1, &b.mlp_w1),
-        (&a.mlp_w2, &b.mlp_w2),
+        (&a.block.a_mat, &b.block.a_mat),
+        (&a.block.w_delta, &b.block.w_delta),
+        (&a.block.w_b, &b.block.w_b),
+        (&a.block.w_c, &b.block.w_c),
+        (&a.block.w_qx, &b.block.w_qx),
+        (&a.block.w_qh, &b.block.w_qh),
+        (&a.block.w_gate, &b.block.w_gate),
+        (&a.block.w_proj, &b.block.w_proj),
+        (&a.block.mlp_w1, &b.block.mlp_w1),
+        (&a.block.mlp_w2, &b.block.mlp_w2),
         (&a.unembed_w, &b.unembed_w),
-        (&a.adapters[0].down_proj, &b.adapters[0].down_proj),
-        (&a.adapters[0].up_proj, &b.adapters[0].up_proj),
+        (&a.block.adapters[0].down_proj, &b.block.adapters[0].down_proj),
+        (&a.block.adapters[0].up_proj, &b.block.adapters[0].up_proj),
     ] {
         matrix(x, y)
     }
-    vector(&a.norm_gamma, &b.norm_gamma);
-    vector(&a.norm_beta, &b.norm_beta);
-    assert_eq!(a.adapters[0].consolidated_up, b.adapters[0].consolidated_up);
-    assert_eq!(a.h_persistent, b.h_persistent);
+    vector(&a.block.norm_gamma, &b.block.norm_gamma);
+    vector(&a.block.norm_beta, &b.block.norm_beta);
+    assert_eq!(a.block.adapters[0].consolidated_up, b.block.adapters[0].consolidated_up);
+    assert_eq!(a.block.h_persistent, b.block.h_persistent);
     assert_eq!(
         (
-            a.memory.count,
-            a.memory.write_head,
-            &a.memory.keys,
-            &a.memory.values,
-            &a.memory.norm_sq,
-            &a.memory.confidence,
-            &a.memory.last_seen_step,
+            a.block.memory.count,
+            a.block.memory.write_head,
+            &a.block.memory.keys,
+            &a.block.memory.values,
+            &a.block.memory.norm_sq,
+            &a.block.memory.confidence,
+            &a.block.memory.last_seen_step,
             &a.embed_row_marks
         ),
         (
-            b.memory.count,
-            b.memory.write_head,
-            &b.memory.keys,
-            &b.memory.values,
-            &b.memory.norm_sq,
-            &b.memory.confidence,
-            &b.memory.last_seen_step,
+            b.block.memory.count,
+            b.block.memory.write_head,
+            &b.block.memory.keys,
+            &b.block.memory.values,
+            &b.block.memory.norm_sq,
+            &b.block.memory.confidence,
+            &b.block.memory.last_seen_step,
             &b.embed_row_marks
         )
     );
@@ -292,45 +292,45 @@ fn old(m: &PSSALayerV2) -> Vec<u8> {
         m.cfg.d_mem_key,
         m.cfg.mem_capacity,
         m.cfg.chunk_len,
-        m.memory.count,
+        m.block.memory.count,
         1,
     ] {
         u(&mut b, n)
     }
     f(&mut b, &m.embed_w.data);
-    f(&mut b, &m.norm_gamma.data);
-    f(&mut b, &m.norm_beta.data);
-    let a: Vec<f32> = m.a_mat.data.iter().map(|x| -(x.exp()).ln_1p()).collect();
+    f(&mut b, &m.block.norm_gamma.data);
+    f(&mut b, &m.block.norm_beta.data);
+    let a: Vec<f32> = m.block.a_mat.data.iter().map(|x| -(x.exp()).ln_1p()).collect();
     f(&mut b, &a);
     for p in [
-        &m.w_delta,
-        &m.w_b,
-        &m.w_c,
-        &m.w_qx,
-        &m.w_qh,
-        &m.w_gate,
-        &m.w_proj,
-        &m.mlp_w1,
-        &m.mlp_w2,
+        &m.block.w_delta,
+        &m.block.w_b,
+        &m.block.w_c,
+        &m.block.w_qx,
+        &m.block.w_qh,
+        &m.block.w_gate,
+        &m.block.w_proj,
+        &m.block.mlp_w1,
+        &m.block.mlp_w2,
         &m.unembed_w,
     ] {
         f(&mut b, &p.data)
     }
-    f(&mut b, &m.memory.keys[..m.memory.count * m.cfg.d_mem_key]);
-    f(&mut b, &m.memory.values[..m.memory.count * m.cfg.d_latent]);
+    f(&mut b, &m.block.memory.keys[..m.block.memory.count * m.cfg.d_mem_key]);
+    f(&mut b, &m.block.memory.values[..m.block.memory.count * m.cfg.d_latent]);
     u(&mut b, 16);
-    f(&mut b, &m.adapters[0].down_proj.data);
-    f(&mut b, &m.adapters[0].up_proj.data);
+    f(&mut b, &m.block.adapters[0].down_proj.data);
+    f(&mut b, &m.block.adapters[0].up_proj.data);
     b
 }
 #[test]
 fn legacy_v5_conversion_and_artifacts() {
     let mut m = model();
     m.vocabulary.clear();
-    m.h_persistent.fill(0.);
-    m.adapters[0].consolidated_up.fill(0.);
-    m.memory.count = 1;
-    m.memory.write_head = 0;
+    m.block.h_persistent.fill(0.);
+    m.block.adapters[0].consolidated_up.fill(0.);
+    m.block.memory.count = 1;
+    m.block.memory.write_head = 0;
     let p = path("legacy");
     fs::write(&p, old(&m)).unwrap();
     let mut b = checkpoint::load_checkpoint(&p).unwrap();
@@ -354,8 +354,8 @@ fn legacy_v5_conversion_and_artifacts() {
 fn malformed_legacy_count_and_rank_are_rejected() {
     let mut m = model();
     m.vocabulary.clear();
-    m.memory.count = 1;
-    m.memory.write_head = 0;
+    m.block.memory.count = 1;
+    m.block.memory.write_head = 0;
     let good = old(&m);
     let mut x = good.clone();
     x[30..34].copy_from_slice(&4u32.to_le_bytes());
