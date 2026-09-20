@@ -71,7 +71,17 @@ Generate one completion:
 cargo run -- generate "quantum mechanics" data/downloaded.txt --model data/model.pssa
 ```
 
-If `data/model.pssa` does not exist, `chat` and `generate` automatically train a four-epoch model before loading it. Training time depends heavily on corpus size and CPU speed.
+If `data/model.pssa` does not exist, `chat` and `generate` report the missing checkpoint; they do not implicitly train one. Train explicitly first. Training time depends heavily on corpus size and CPU speed.
+
+### Auditable training runs
+
+Pass `--run-dir PATH` to opt into durable, non-overwriting training evidence:
+
+```bash
+cargo run --release -- train data/downloaded.txt --epochs 4 --out data/model.pssa --run-dir runs/2026-09-16-bpe
+```
+
+`PATH` must not already exist, including as an empty directory. The command writes `run.json`, an atomically updated `metrics.json` array, and self-contained V7 checkpoints `epoch-0000.pssa` (initialized model) through one checkpoint per completed epoch. The metadata records the model dimensions, seed, tokenizer scope, reset/memory policy, and the fact that `--max-tokens` is an encoded training-prefix cap per epoch whose scored transition count is lower. These artifacts are for evidence and model selection only: the CLI has no resume support, and a failed later write does not replace earlier completed artifacts. Without `--run-dir`, training retains its existing final-checkpoint-only behavior.
 
 ## CLI Reference
 
@@ -102,6 +112,7 @@ Options:
 | `-p, --prompt <text>` | empty | `generate` | Prompt text. Required for generation. |
 | `-t, --temp <float>` | `0.70` for chat, `0.25` for generation | `chat` | Sampling temperature. |
 | `-o, --out <path>` | `data/model.pssa` | `train`, `download` | Output model or dataset path. |
+| `--run-dir <path>` | unset | `train` | New directory for atomic epoch checkpoints and metrics; never reused and not a resume interface. |
 
 Positional arguments and long/short options can be mixed. For example:
 

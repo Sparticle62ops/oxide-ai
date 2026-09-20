@@ -33,6 +33,4 @@ Do **not** commit installed compiler directories or `target/` into Git. A Rust i
 
 ## Current acceptance status
 
-See `STACKED-WIP.md`. The latest all-target release acceptance run passed 56 tests with no failures. The controlled four-configuration training comparison is not complete, and passing correctness tests is not a claim that coherent language generation works. Do not redesign the CLI or implement new WGPU functionality before that language-quality gate.
-
-For the complete gate, use `cargo test --locked --release -j1 --all-targets -- --nocapture` with the settings above. Before launching the frozen corpus study, run `bun scripts/verify-preflight.ts STUDY_ROOT RUNNER_BINARY` against the prepared private manifests, preflight outputs and SHA-256 provenance. This separate strict validator enforces the protocol; the Rust runner remains parameterized so small deterministic resume tests are possible.
+See `STACKED-WIP.md`. This development snapshot includes unfinished acceptance tests and is not a claim that coherent language generation works. Do not redesign the CLI or implement new WGPU functionality before that language-quality gate.
