@@ -26,8 +26,9 @@ git log --oneline -1
 echo
 echo "### 2. Build"
 cargo build --release
-./target/release/oxide_ai_pssa train --help 2>&1 | grep -- --resume || {
+./target/release/oxide_ai_pssa help 2>&1 | grep -q -- '--resume' || {
   echo "ERROR: this checkout has no --resume, stopping"; exit 1; }
+echo "--resume present"
 
 echo
 echo "### 3. Continue the chain"
