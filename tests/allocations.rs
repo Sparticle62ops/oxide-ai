@@ -94,7 +94,7 @@ fn live_model_training_inference_memory_and_consolidation_allocate_nothing() {
         0.07, 0.08,
     ];
     for _ in 0..model.cfg.mem_capacity {
-        model.memory.insert(&key, &value);
+        model.block.memory.insert(&key, &value);
     }
     let tokens = [1, 5, 9];
     let targets = [2, 6, 10];
@@ -113,9 +113,9 @@ fn live_model_training_inference_memory_and_consolidation_allocate_nothing() {
         model.reset_recurrent_state();
         model.forward_inference(tokens[0], &mut logits);
         model
-            .memory
+            .block.memory
             .retrieve_soft_into(&key, model.cfg.tau_mem, &mut retrieved, &mut weights);
-        model.memory.insert(&key, &value);
+        model.block.memory.insert(&key, &value);
         model.ema_consolidate_plasticity();
     }
     let counts = stop_counting();

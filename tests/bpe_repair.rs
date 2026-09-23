@@ -117,16 +117,16 @@ fn bpe_generation_streams_display_text_not_bytelevel_labels() {
     model.vocabulary = tokenizer.ordered_vocabulary().unwrap();
     model.tokenizer_json = tokenizer.serialized_metadata();
     model.embed_w.data.fill(0.);
-    model.a_mat.data.fill(0.);
-    model.w_delta.data.fill(0.);
-    model.w_b.data.fill(0.);
-    model.w_c.data.fill(0.);
-    model.w_qx.data.fill(0.);
-    model.w_qh.data.fill(0.);
-    model.w_gate.data.fill(0.);
-    model.w_proj.data.fill(0.);
-    model.mlp_w1.data.fill(0.);
-    model.mlp_w2.data.fill(0.);
+    model.block.a_mat.data.fill(0.);
+    model.block.w_delta.data.fill(0.);
+    model.block.w_b.data.fill(0.);
+    model.block.w_c.data.fill(0.);
+    model.block.w_qx.data.fill(0.);
+    model.block.w_qh.data.fill(0.);
+    model.block.w_gate.data.fill(0.);
+    model.block.w_proj.data.fill(0.);
+    model.block.mlp_w1.data.fill(0.);
+    model.block.mlp_w2.data.fill(0.);
     model.unembed_w.data.fill(0.);
     let mut segments = Vec::new();
     let out = PSSAInferenceEngine::try_new(&mut model, &tokenizer)
@@ -162,6 +162,7 @@ fn fresh_bpe_cli_checkpoint_generates_without_corpus() {
         max_tokens: None,
         tokenizer: TokenizerKind::Bpe,
         vocab_size: 300,
+        resume: None,
     };
     let (model, _) = CLIHandler::train_corpus(raw, &opts).unwrap();
     let p = temp("fresh.pssa");

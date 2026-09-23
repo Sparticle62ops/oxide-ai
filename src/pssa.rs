@@ -268,14 +268,39 @@ impl Default for PSSAConfigV2 {
 }
 
 // =============================================================================
-// ZERO-ALLOCATION TBPTT ACTIVATION TAPE
+// OWNED CONTINUOUS BLOCK AND MODEL-ENDPOINT TAPES
 // =============================================================================
 
 #[derive(Clone, Debug)]
-pub struct ChunkActivationTape {
+pub struct PSSAContinuousConfigV2 {
+    pub d_latent: usize,
+    pub d_state: usize,
+    pub d_mem_key: usize,
+    pub mem_capacity: usize,
+    pub chunk_len: usize,
+    pub tau_mem: f32,
+    pub ema_alpha: f32,
+}
+
+impl From<&PSSAConfigV2> for PSSAContinuousConfigV2 {
+    fn from(c: &PSSAConfigV2) -> Self {
+        Self {
+            d_latent: c.d_latent,
+            d_state: c.d_state,
+            d_mem_key: c.d_mem_key,
+            mem_capacity: c.mem_capacity,
+            chunk_len: c.chunk_len,
+            tau_mem: c.tau_mem,
+            ema_alpha: c.ema_alpha,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct PSSAContinuousTapeV2 {
     pub max_l: usize,
-    pub x_ids: Vec<usize>,
-    pub target_ids: Vec<usize>,
+    /// Raw caller-owned continuous features, cached for affine RMS backward.
+    pub x_raw: Vec<f32>,
     pub x_norm: Vec<f32>,
     pub inv_rms: Vec<f32>,
     pub delta_raw: Vec<f32>,
@@ -300,49 +325,57 @@ pub struct ChunkActivationTape {
     pub mlp_hidden: Vec<f32>,
     pub mlp_act: Vec<f32>,
     pub z_final: Vec<f32>,
+}
+
+impl PSSAContinuousTapeV2 {
+    fn new(max_l: usize, d_m: usize, d_s: usize, d_k: usize, cap: usize, rank: usize) -> Self {
+        Self {
+            max_l,
+            x_raw: vec![0.0; max_l * d_m],
+            x_norm: vec![0.0; max_l * d_m],
+            inv_rms: vec![0.0; max_l],
+            delta_raw: vec![0.0; max_l * d_m],
+            delta: vec![0.0; max_l * d_m],
+            b_proj: vec![0.0; max_l * d_s],
+            c_proj: vec![0.0; max_l * d_s],
+            bar_a: vec![0.0; max_l * d_m * d_s],
+            bar_b: vec![0.0; max_l * d_m * d_s],
+            h_states: vec![0.0; (max_l + 1) * d_m * d_s],
+            y_ssm: vec![0.0; max_l * d_m],
+            q_euc: vec![0.0; max_l * d_k],
+            q_norm: vec![0.0; max_l],
+            q_poincare: vec![0.0; max_l * d_k],
+            mem_weights: vec![0.0; max_l * cap],
+            m_val: vec![0.0; max_l * d_m],
+            g_mem: vec![0.0; max_l * d_m],
+            m_inj: vec![0.0; max_l * d_m],
+            m_proj: vec![0.0; max_l * d_m],
+            adapter_hidden: vec![0.0; max_l * rank],
+            adapter_act: vec![0.0; max_l * rank],
+            z_raw: vec![0.0; max_l * d_m],
+            mlp_hidden: vec![0.0; max_l * 2 * d_m],
+            mlp_act: vec![0.0; max_l * 2 * d_m],
+            z_final: vec![0.0; max_l * d_m],
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ModelEndpointTapeV2 {
+    pub max_l: usize,
+    pub x_ids: Vec<usize>,
+    pub target_ids: Vec<usize>,
     pub logits: Vec<f32>,
     pub probs: Vec<f32>,
     pub losses: Vec<f32>,
 }
 
-impl ChunkActivationTape {
-    pub fn new(
-        max_l: usize,
-        d_vocab: usize,
-        d_latent: usize,
-        d_state: usize,
-        d_key: usize,
-        mem_cap: usize,
-        rank: usize,
-    ) -> Self {
+impl ModelEndpointTapeV2 {
+    fn new(max_l: usize, d_vocab: usize) -> Self {
         Self {
             max_l,
             x_ids: vec![0; max_l],
             target_ids: vec![0; max_l],
-            x_norm: vec![0.0; max_l * d_latent],
-            inv_rms: vec![0.0; max_l],
-            delta_raw: vec![0.0; max_l * d_latent],
-            delta: vec![0.0; max_l * d_latent],
-            b_proj: vec![0.0; max_l * d_state],
-            c_proj: vec![0.0; max_l * d_state],
-            bar_a: vec![0.0; max_l * d_latent * d_state],
-            bar_b: vec![0.0; max_l * d_latent * d_state],
-            h_states: vec![0.0; (max_l + 1) * d_latent * d_state],
-            y_ssm: vec![0.0; max_l * d_latent],
-            q_euc: vec![0.0; max_l * d_key],
-            q_norm: vec![0.0; max_l],
-            q_poincare: vec![0.0; max_l * d_key],
-            mem_weights: vec![0.0; max_l * mem_cap],
-            m_val: vec![0.0; max_l * d_latent],
-            g_mem: vec![0.0; max_l * d_latent],
-            m_inj: vec![0.0; max_l * d_latent],
-            m_proj: vec![0.0; max_l * d_latent],
-            adapter_hidden: vec![0.0; max_l * rank],
-            adapter_act: vec![0.0; max_l * rank],
-            z_raw: vec![0.0; max_l * d_latent],
-            mlp_hidden: vec![0.0; max_l * 2 * d_latent],
-            mlp_act: vec![0.0; max_l * 2 * d_latent],
-            z_final: vec![0.0; max_l * d_latent],
             logits: vec![0.0; max_l * d_vocab],
             probs: vec![0.0; max_l * d_vocab],
             losses: vec![0.0; max_l],
@@ -350,262 +383,185 @@ impl ChunkActivationTape {
     }
 }
 
-// =============================================================================
-// PSSA LAYER V2 - MULTI-CHANNEL NEURAL ENGINE
-// =============================================================================
-
-pub struct PSSALayerV2 {
-    pub cfg: PSSAConfigV2,
-    pub step_counter: usize,
-    pub device: Device,
-    pub rng: SimpleRng,
-    /// Ordered tokenizer token strings persisted in V6 checkpoints. Empty means
-    /// no tokenizer identity is attached (notably checked legacy V5 warm starts).
-    pub vocabulary: Vec<String>,
-    /// Exact serialized standard tokenizer metadata for V7 byte-level BPE.
-    /// `None` denotes the legacy word tokenizer policy.
-    pub tokenizer_json: Option<String>,
-
-    // 1. Learned Affine RMSNorm & Embeddings
-    pub embed_w: ParamMatrix,
+/// Independently owned, vocabulary-free affine-RMS/SSM/memory/adapter/MLP block.
+/// It accepts and differentiates raw continuous features; detached memory contents
+/// and recurrent carry are state, not graph edges across chunks.
+pub struct PSSAContinuousBlockV2 {
+    pub cfg: PSSAContinuousConfigV2,
     pub norm_gamma: ParamVector,
     pub norm_beta: ParamVector,
-
-    // 2. Multi-Channel Continuous SSM Recurrence
     pub a_mat: ParamMatrix,
     pub w_delta: ParamMatrix,
     pub w_b: ParamMatrix,
     pub w_c: ParamMatrix,
     pub h_persistent: Vec<f32>,
-
-    // 3. Diffeomorphic Poincaré Episodic Memory
     pub w_qx: ParamMatrix,
     pub w_qh: ParamMatrix,
     pub w_gate: ParamMatrix,
     pub w_proj: ParamMatrix,
     pub memory: HyperbolicEpisodicBankV2,
-
-    // 4. Zero-Init Plastic Adapters
     pub adapters: Vec<PlasticAdapterV2>,
-
-    // 5. SiLU Feed-Forward Expansion Head
     pub mlp_w1: ParamMatrix,
     pub mlp_w2: ParamMatrix,
-
-    // 6. Output Logits Projection
-    pub unembed_w: ParamMatrix,
-
-    // Preallocated Tape for Zero-Allocation Training
-    pub tape: ChunkActivationTape,
-
-    // Backward Temporary Adjoint Buffers
-    pub grad_h_next: Vec<f32>,
-    pub grad_z_final: Vec<f32>,
-    pub grad_z_raw: Vec<f32>,
-    pub grad_x_norm: Vec<f32>,
-    pub embed_row_marks: Vec<usize>,
-    pub buf_m_proj: Vec<f32>,
-    pub buf_ad_out: Vec<f32>,
-    pub buf_g_mlp_act: Vec<f32>,
-    pub buf_g_mlp_hidden: Vec<f32>,
-    pub buf_g_zraw_mlp: Vec<f32>,
-    pub buf_g_ad_act: Vec<f32>,
-    pub buf_g_ad_down: Vec<f32>,
-    pub buf_g_m_proj_out: Vec<f32>,
-    pub buf_g_m_val: Vec<f32>,
-    /// Retrieval-query adjoints, reused per reverse-time step.
-    pub g_query_pnc: Vec<f32>,
-    pub g_query_euc: Vec<f32>,
-    pub g_y_ssm: Vec<f32>,
-    pub buf_g_delta: Vec<f32>,
-    pub buf_g_b_proj: Vec<f32>,
-    pub buf_g_c_proj: Vec<f32>,
-    pub buf_g_h_prev: Vec<f32>,
-
-    // Inference Scratch Buffers
-    pub inf_x_norm: Vec<f32>,
-    pub inf_delta: Vec<f32>,
-    pub inf_b: Vec<f32>,
-    pub inf_c: Vec<f32>,
-    pub inf_y_ssm: Vec<f32>,
-    pub inf_q_euc: Vec<f32>,
-    pub inf_q_pnc: Vec<f32>,
-    pub inf_mem_weights: Vec<f32>,
-    pub inf_m_val: Vec<f32>,
-    pub inf_g_mem: Vec<f32>,
-    pub inf_m_proj: Vec<f32>,
-    pub inf_ad_act: Vec<f32>,
-    pub inf_ad_out: Vec<f32>,
-    pub inf_z_raw: Vec<f32>,
-    pub inf_mlp_act: Vec<f32>,
-    pub inf_mlp_out: Vec<f32>,
-    pub inf_z_final: Vec<f32>,
+    pub tape: PSSAContinuousTapeV2,
+    grad_h_next: Vec<f32>,
+    grad_z_final: Vec<f32>,
+    grad_z_raw: Vec<f32>,
+    grad_x_norm: Vec<f32>,
+    buf_m_proj: Vec<f32>,
+    buf_ad_out: Vec<f32>,
+    buf_g_mlp_act: Vec<f32>,
+    buf_g_mlp_hidden: Vec<f32>,
+    buf_g_zraw_mlp: Vec<f32>,
+    buf_g_ad_act: Vec<f32>,
+    buf_g_ad_down: Vec<f32>,
+    buf_g_m_proj_out: Vec<f32>,
+    buf_g_m_val: Vec<f32>,
+    g_query_pnc: Vec<f32>,
+    g_query_euc: Vec<f32>,
+    g_y_ssm: Vec<f32>,
+    buf_g_delta: Vec<f32>,
+    buf_g_b_proj: Vec<f32>,
+    buf_g_c_proj: Vec<f32>,
+    buf_g_h_prev: Vec<f32>,
+    inf_x_norm: Vec<f32>,
+    inf_delta: Vec<f32>,
+    inf_b: Vec<f32>,
+    inf_c: Vec<f32>,
+    inf_y_ssm: Vec<f32>,
+    inf_q_euc: Vec<f32>,
+    inf_q_pnc: Vec<f32>,
+    inf_mem_weights: Vec<f32>,
+    inf_m_val: Vec<f32>,
+    inf_g_mem: Vec<f32>,
+    inf_m_proj: Vec<f32>,
+    inf_ad_act: Vec<f32>,
+    inf_ad_out: Vec<f32>,
+    inf_z_raw: Vec<f32>,
+    inf_mlp_act: Vec<f32>,
+    inf_mlp_out: Vec<f32>,
 }
 
-impl PSSALayerV2 {
-    pub fn new(cfg: PSSAConfigV2, seed: u64) -> Self {
-        Self::new_with_device(cfg, seed, Device::Cpu)
-    }
-
-    pub fn new_with_device(cfg: PSSAConfigV2, seed: u64, device: Device) -> Self {
-        cfg.validate();
-        assert!(
-            !device.is_gpu(),
-            "Device::Gpu is not dispatched by PSSALayerV2; use Device::Cpu"
-        );
-        let mut rng = SimpleRng::new(seed);
-        let d_v = cfg.d_vocab;
+/// Token endpoint with a first continuous block and zero or more residual blocks.
+/// `block` is retained as layer zero for depth-one compatibility; all further
+/// blocks own their recurrent state, bank, tape, and optimizer moments.
+pub struct PSSALayerV2 {
+    pub cfg: PSSAConfigV2,
+    pub step_counter: usize,
+    pub device: Device,
+    pub rng: SimpleRng,
+    pub vocabulary: Vec<String>,
+    pub tokenizer_json: Option<String>,
+    pub embed_w: ParamMatrix,
+    pub block: PSSAContinuousBlockV2,
+    pub extra_blocks: Vec<PSSAContinuousBlockV2>,
+    /// Fixed, non-trainable residual branch scales, one for each extra block.
+    pub residual_scales: Vec<f32>,
+    pub unembed_w: ParamMatrix,
+    pub tape: ModelEndpointTapeV2,
+    pub embed_row_marks: Vec<usize>,
+    /// Loss-normalized adjoints at raw embeddings, layer-zero output, and all
+    /// residual outputs.  Every vector is allocated at construction time.
+    pub boundary_adjoints: Vec<Vec<f32>>,
+    continuous_inputs: Vec<f32>,
+    output_adjoints: Vec<f32>,
+    input_adjoints: Vec<f32>,
+    residual_block_adjoints: Vec<f32>,
+    residual_input_adjoints: Vec<f32>,
+    /// Outputs of extra blocks after their residual connection.
+    layer_activations: Vec<Vec<f32>>,
+    inf_features: Vec<f32>,
+    inf_z_final: Vec<f32>,
+    inf_block_out: Vec<f32>,
+}
+impl PSSAContinuousBlockV2 {
+    fn new_with_rng(cfg: PSSAContinuousConfigV2, rng: &mut SimpleRng) -> Self {
         let d_m = cfg.d_latent;
         let d_s = cfg.d_state;
         let d_k = cfg.d_mem_key;
         let d_mlp = d_m * 2;
-        let mem_cap = cfg.mem_capacity;
+        let cap = cfg.mem_capacity;
         let chunk_len = cfg.chunk_len;
         let rank = 16;
-
-        let embed_w = ParamMatrix::random_xavier(d_v, d_m, &mut rng);
         let norm_gamma = ParamVector::new(d_m, 1.0);
         let norm_beta = ParamVector::new(d_m, 0.0);
-
-        // Continuous HiPPO timescale decay initialization
         let mut a_mat = ParamMatrix::zeros(d_m, d_s);
         let ln_min = 1.5f32.ln();
         let ln_max = 200.0f32.ln();
         for i in 0..d_m {
             for j in 0..d_s {
-                let ratio = if d_s > 1 {
-                    j as f32 / (d_s - 1) as f32
-                } else {
-                    0.0
-                };
+                let ratio = if d_s > 1 { j as f32 / (d_s - 1) as f32 } else { 0.0 };
                 let tau = (ln_min + ratio * (ln_max - ln_min)).exp();
-                // Store an unconstrained raw rate. Physical A is -softplus(raw).
                 let rate = 1.0 / tau;
                 a_mat.data[i * d_s + j] = rate.exp_m1().ln();
             }
         }
-
-        let w_delta = ParamMatrix::random_xavier(d_m, d_m, &mut rng);
-        let w_b = ParamMatrix::random_xavier(d_s, d_m, &mut rng);
-        let w_c = ParamMatrix::random_xavier(d_s, d_m, &mut rng);
-        let h_persistent = vec![0.0; d_m * d_s];
-
-        let w_qx = ParamMatrix::random_xavier(d_k, d_m, &mut rng);
-        let w_qh = ParamMatrix::random_xavier(d_k, d_m, &mut rng);
-        let w_gate = ParamMatrix::random_xavier(d_m, d_m, &mut rng);
-        let w_proj = ParamMatrix::random_xavier(d_m, d_m, &mut rng);
-        let memory = HyperbolicEpisodicBankV2::new(mem_cap, d_k, d_m);
-
-        let mut adapters = Vec::new();
-        adapters.push(PlasticAdapterV2::new(d_m, rank, &mut rng));
-
-        let mlp_w1 = ParamMatrix::random_xavier(d_mlp, d_m, &mut rng);
+        let w_delta = ParamMatrix::random_xavier(d_m, d_m, rng);
+        let w_b = ParamMatrix::random_xavier(d_s, d_m, rng);
+        let w_c = ParamMatrix::random_xavier(d_s, d_m, rng);
+        let w_qx = ParamMatrix::random_xavier(d_k, d_m, rng);
+        let w_qh = ParamMatrix::random_xavier(d_k, d_m, rng);
+        let w_gate = ParamMatrix::random_xavier(d_m, d_m, rng);
+        let w_proj = ParamMatrix::random_xavier(d_m, d_m, rng);
+        let adapters = vec![PlasticAdapterV2::new(d_m, rank, rng)];
+        let mlp_w1 = ParamMatrix::random_xavier(d_mlp, d_m, rng);
         let mlp_w2 = ParamMatrix::zeros(d_m, d_mlp);
-        let unembed_w = ParamMatrix::random_xavier(d_v, d_m, &mut rng);
-
-        let tape = ChunkActivationTape::new(chunk_len, d_v, d_m, d_s, d_k, mem_cap, rank);
-
         Self {
             cfg,
-            step_counter: 0,
-            device,
-            rng,
-            vocabulary: Vec::new(),
-            tokenizer_json: None,
-            embed_w,
-            norm_gamma,
-            norm_beta,
-            a_mat,
-            w_delta,
-            w_b,
-            w_c,
-            h_persistent,
-            w_qx,
-            w_qh,
-            w_gate,
-            w_proj,
-            memory,
-            adapters,
-            mlp_w1,
-            mlp_w2,
-            unembed_w,
-            tape,
-            grad_h_next: vec![0.0; d_m * d_s],
-            grad_z_final: vec![0.0; d_m],
-            grad_z_raw: vec![0.0; d_m],
-            grad_x_norm: vec![0.0; d_m],
-            embed_row_marks: vec![0; d_v],
-            buf_m_proj: vec![0.0; d_m],
-            buf_ad_out: vec![0.0; d_m],
-            buf_g_mlp_act: vec![0.0; d_mlp],
-            buf_g_mlp_hidden: vec![0.0; d_mlp],
-            buf_g_zraw_mlp: vec![0.0; d_m],
-            buf_g_ad_act: vec![0.0; rank],
-            buf_g_ad_down: vec![0.0; rank],
-            buf_g_m_proj_out: vec![0.0; d_m],
-            buf_g_m_val: vec![0.0; d_m],
-            g_query_pnc: vec![0.0; d_k],
-            g_query_euc: vec![0.0; d_k],
-            g_y_ssm: vec![0.0; d_m],
-            buf_g_delta: vec![0.0; d_m],
-            buf_g_b_proj: vec![0.0; d_s],
-            buf_g_c_proj: vec![0.0; d_s],
-            buf_g_h_prev: vec![0.0; d_m * d_s],
-            inf_x_norm: vec![0.0; d_m],
-            inf_delta: vec![0.0; d_m],
-            inf_b: vec![0.0; d_s],
-            inf_c: vec![0.0; d_s],
-            inf_y_ssm: vec![0.0; d_m],
-            inf_q_euc: vec![0.0; d_k],
-            inf_q_pnc: vec![0.0; d_k],
-            inf_mem_weights: vec![0.0; mem_cap],
-            inf_m_val: vec![0.0; d_m],
-            inf_g_mem: vec![0.0; d_m],
-            inf_m_proj: vec![0.0; d_m],
-            inf_ad_act: vec![0.0; rank],
-            inf_ad_out: vec![0.0; d_m],
-            inf_z_raw: vec![0.0; d_m],
-            inf_mlp_act: vec![0.0; d_mlp],
+            norm_gamma, norm_beta, a_mat, w_delta, w_b, w_c,
+            h_persistent: vec![0.0; d_m * d_s],
+            w_qx, w_qh, w_gate, w_proj,
+            memory: HyperbolicEpisodicBankV2::new(cap, d_k, d_m),
+            adapters, mlp_w1, mlp_w2,
+            tape: PSSAContinuousTapeV2::new(chunk_len, d_m, d_s, d_k, cap, rank),
+            grad_h_next: vec![0.0; d_m*d_s], grad_z_final: vec![0.0; d_m],
+            grad_z_raw: vec![0.0; d_m], grad_x_norm: vec![0.0; d_m],
+            buf_m_proj: vec![0.0; d_m], buf_ad_out: vec![0.0; d_m],
+            buf_g_mlp_act: vec![0.0; d_mlp], buf_g_mlp_hidden: vec![0.0; d_mlp],
+            buf_g_zraw_mlp: vec![0.0; d_m], buf_g_ad_act: vec![0.0; rank],
+            buf_g_ad_down: vec![0.0; rank], buf_g_m_proj_out: vec![0.0; d_m],
+            buf_g_m_val: vec![0.0; d_m], g_query_pnc: vec![0.0; d_k],
+            g_query_euc: vec![0.0; d_k], g_y_ssm: vec![0.0; d_m],
+            buf_g_delta: vec![0.0; d_m], buf_g_b_proj: vec![0.0; d_s],
+            buf_g_c_proj: vec![0.0; d_s], buf_g_h_prev: vec![0.0; d_m*d_s],
+            inf_x_norm: vec![0.0; d_m], inf_delta: vec![0.0; d_m],
+            inf_b: vec![0.0; d_s], inf_c: vec![0.0; d_s], inf_y_ssm: vec![0.0; d_m],
+            inf_q_euc: vec![0.0; d_k], inf_q_pnc: vec![0.0; d_k],
+            inf_mem_weights: vec![0.0; cap], inf_m_val: vec![0.0; d_m],
+            inf_g_mem: vec![0.0; d_m], inf_m_proj: vec![0.0; d_m],
+            inf_ad_act: vec![0.0; rank], inf_ad_out: vec![0.0; d_m],
+            inf_z_raw: vec![0.0; d_m], inf_mlp_act: vec![0.0; d_mlp],
             inf_mlp_out: vec![0.0; d_m],
-            inf_z_final: vec![0.0; d_m],
         }
     }
 
-    pub fn reset_recurrent_state(&mut self) {
-        self.h_persistent.fill(0.0);
-    }
+    pub fn reset_recurrent_state(&mut self) { self.h_persistent.fill(0.0); }
 
-    // =========================================================================
-    // 1. HIGH-SPEED INFERENCE PATHWAY (ZERO BACKPROP OVERHEAD)
-    // =========================================================================
+    /// Single-token raw-continuous inference. Performs this block's affine RMS norm.
     #[inline(always)]
-    pub fn forward_inference(&mut self, x_id: usize, logits_out: &mut [f32]) {
+    pub fn forward_continuous_inference(&mut self, x_features: &[f32], z_out: &mut [f32]) {
+        assert_eq!(x_features.len(), self.cfg.d_latent);
+        assert_eq!(z_out.len(), self.cfg.d_latent);
         let d_m = self.cfg.d_latent;
+        let sum_sq: f32 = x_features.iter().map(|&x| x * x).sum();
+        let inv_rms = 1.0 / (sum_sq / d_m as f32 + 1e-5).sqrt();
+        for i in 0..d_m {
+            self.inf_x_norm[i] = self.norm_gamma.data[i] * (x_features[i] * inv_rms) + self.norm_beta.data[i];
+        }
+        let x_norm = &self.inf_x_norm;
         let d_s = self.cfg.d_state;
         let d_k = self.cfg.d_mem_key;
         let d_mlp = d_m * 2;
         let rank = self.adapters[0].rank;
         let ssm_scale = 1.0 / (d_s as f32).sqrt();
-        let logit_scale = 1.0 / (d_m as f32).sqrt();
-
-        // 1. Embedding & Affine RMSNorm
-        let e_t = &self.embed_w.data[x_id * d_m..(x_id + 1) * d_m];
-        let sum_sq: f32 = e_t.iter().map(|&x| x * x).sum();
-        let inv_rms = 1.0 / (sum_sq / (d_m as f32) + 1e-5).sqrt();
-
-        for i in 0..d_m {
-            self.inf_x_norm[i] =
-                self.norm_gamma.data[i] * (e_t[i] * inv_rms) + self.norm_beta.data[i];
-        }
-
         // 2. Data-Dependent Projections
-        self.w_delta.matvec(&self.inf_x_norm, &mut self.inf_delta);
+        self.w_delta.matvec(x_norm, &mut self.inf_delta);
         for i in 0..d_m {
             self.inf_delta[i] = softplus(self.inf_delta[i]);
         }
 
-        self.w_b.matvec(&self.inf_x_norm, &mut self.inf_b);
-        self.w_c.matvec(&self.inf_x_norm, &mut self.inf_c);
+        self.w_b.matvec(x_norm, &mut self.inf_b);
+        self.w_c.matvec(x_norm, &mut self.inf_c);
 
         // 3. Multi-Channel SSM State Update (In-Place on Persistent State)
         for i in 0..d_m {
@@ -618,7 +574,7 @@ impl PSSALayerV2 {
                 let bar_a = (d_i * -softplus(self.a_mat.data[idx])).exp();
                 let bar_b = d_i * self.inf_b[j];
 
-                let h_val = bar_a * self.h_persistent[idx] + bar_b * self.inf_x_norm[i];
+                let h_val = bar_a * self.h_persistent[idx] + bar_b * x_norm[i];
                 self.h_persistent[idx] = h_val;
                 y_i += h_val * self.inf_c[j];
             }
@@ -630,7 +586,7 @@ impl PSSALayerV2 {
             let row_x = &self.w_qx.data[r * d_m..(r + 1) * d_m];
             let row_h = &self.w_qh.data[r * d_m..(r + 1) * d_m];
             self.inf_q_euc[r] =
-                dot_slice(row_x, &self.inf_x_norm) + dot_slice(row_h, &self.inf_y_ssm);
+                dot_slice(row_x, x_norm) + dot_slice(row_h, &self.inf_y_ssm);
         }
 
         HyperbolicEpisodicBankV2::diffeomorphic_project(&self.inf_q_euc, &mut self.inf_q_pnc);
@@ -642,7 +598,7 @@ impl PSSALayerV2 {
             &mut self.inf_mem_weights,
         );
 
-        self.w_gate.matvec(&self.inf_x_norm, &mut self.inf_g_mem);
+        self.w_gate.matvec(x_norm, &mut self.inf_g_mem);
         for i in 0..d_m {
             self.inf_g_mem[i] = sigmoid(self.inf_g_mem[i]);
         }
@@ -652,7 +608,7 @@ impl PSSALayerV2 {
         // 5. Plastic Adapter
         self.adapters[0]
             .down_proj
-            .matvec(&self.inf_x_norm, &mut self.inf_ad_act[..rank]);
+            .matvec(x_norm, &mut self.inf_ad_act[..rank]);
         for r in 0..rank {
             let h = self.inf_ad_act[r];
             self.inf_ad_act[r] = h * sigmoid(h);
@@ -676,68 +632,34 @@ impl PSSALayerV2 {
         self.mlp_w2
             .matvec(&self.inf_mlp_act[..d_mlp], &mut self.inf_mlp_out);
         for i in 0..d_m {
-            self.inf_z_final[i] = self.inf_z_raw[i] + self.inf_mlp_out[i];
+            z_out[i] = self.inf_z_raw[i] + self.inf_mlp_out[i];
         }
 
-        // 7. Output Vocabulary Logits
-        self.unembed_w.matvec(&self.inf_z_final, logits_out);
-        for logit in logits_out.iter_mut() {
-            *logit *= logit_scale;
-        }
     }
 
-    // =========================================================================
-    // 2. TBPTT SEQUENCE TRAINING PATHWAY
-    // =========================================================================
-    pub fn forward_train_chunk(&mut self, token_ids: &[usize], target_ids: &[usize]) -> f32 {
-        assert!(!token_ids.is_empty(), "training chunk must be nonempty");
-        assert_eq!(
-            token_ids.len(),
-            target_ids.len(),
-            "token and target counts must match"
-        );
-        let seq_len = token_ids.len().min(self.cfg.chunk_len);
-        assert!(seq_len > 0);
-        assert!(
-            token_ids[..seq_len].iter().all(|&id| id < self.cfg.d_vocab)
-                && target_ids[..seq_len]
-                    .iter()
-                    .all(|&id| id < self.cfg.d_vocab),
-            "token IDs must be in vocabulary"
-        );
+    /// Chunk forward from raw continuous rows. Outputs remain in `tape.z_final`.
+    pub fn forward_train_chunk(&mut self, raw_features: &[f32], seq_len: usize) -> &[f32] {
+        assert!(seq_len > 0 && seq_len <= self.cfg.chunk_len);
         let d_m = self.cfg.d_latent;
+        assert_eq!(raw_features.len(), seq_len * d_m);
         let d_s = self.cfg.d_state;
         let d_k = self.cfg.d_mem_key;
-        let d_v = self.cfg.d_vocab;
         let d_mlp = d_m * 2;
         let mem_cap = self.cfg.mem_capacity;
         let rank = self.adapters[0].rank;
         let ssm_scale = 1.0 / (d_s as f32).sqrt();
-        let logit_scale = 1.0 / (d_m as f32).sqrt();
-
-        self.tape.x_ids[..seq_len].copy_from_slice(&token_ids[..seq_len]);
-        self.tape.target_ids[..seq_len].copy_from_slice(&target_ids[..seq_len]);
-        self.tape.h_states[..d_m * d_s].copy_from_slice(&self.h_persistent);
-
-        let mut total_loss = 0.0f32;
-
+        self.tape.x_raw[..seq_len*d_m].copy_from_slice(raw_features);
+        self.tape.h_states[..d_m*d_s].copy_from_slice(&self.h_persistent);
         for t in 0..seq_len {
-            let x_id = self.tape.x_ids[t];
-            let tgt_id = self.tape.target_ids[t];
-
-            // 1. Embedding & Affine RMSNorm
-            let e_t = &self.embed_w.data[x_id * d_m..(x_id + 1) * d_m];
-            let sum_sq: f32 = e_t.iter().map(|&x| x * x).sum();
-            let inv_rms = 1.0 / (sum_sq / (d_m as f32) + 1e-5).sqrt();
+            let raw_off = t*d_m;
+            let raw = &self.tape.x_raw[raw_off..raw_off+d_m];
+            let sum_sq: f32 = raw.iter().map(|&x| x*x).sum();
+            let inv_rms = 1.0 / (sum_sq / d_m as f32 + 1e-5).sqrt();
             self.tape.inv_rms[t] = inv_rms;
-
-            let xn_off = t * d_m;
             for i in 0..d_m {
-                self.tape.x_norm[xn_off + i] =
-                    self.norm_gamma.data[i] * (e_t[i] * inv_rms) + self.norm_beta.data[i];
+                self.tape.x_norm[raw_off+i] = self.norm_gamma.data[i] * (raw[i]*inv_rms) + self.norm_beta.data[i];
             }
-            let x_n = &self.tape.x_norm[xn_off..xn_off + d_m];
-
+            let x_n = &self.tape.x_norm[raw_off..raw_off+d_m];
             // 2. Data-Dependent Projections
             let del_off = t * d_m;
             self.w_delta
@@ -854,112 +776,35 @@ impl PSSALayerV2 {
             for i in 0..d_m {
                 self.tape.z_final[z_off + i] += z_raw[i];
             }
-            let z_final = &self.tape.z_final[z_off..z_off + d_m];
-
-            // 7. Output Vocabulary Logits & Softmax Loss
-            let log_off = t * d_v;
-            self.unembed_w
-                .matvec(z_final, &mut self.tape.logits[log_off..log_off + d_v]);
-            for i in 0..d_v {
-                self.tape.logits[log_off + i] *= logit_scale;
-            }
-
-            let mut max_l = f32::NEG_INFINITY;
-            for i in 0..d_v {
-                let l = self.tape.logits[log_off + i];
-                if l > max_l {
-                    max_l = l;
-                }
-            }
-
-            let mut sum_exp = 0.0f32;
-            for i in 0..d_v {
-                let exp_l = (self.tape.logits[log_off + i] - max_l).exp();
-                self.tape.probs[log_off + i] = exp_l;
-                sum_exp += exp_l;
-            }
-            let inv_sum = 1.0 / sum_exp.max(1e-8);
-            for i in 0..d_v {
-                self.tape.probs[log_off + i] *= inv_sum;
-            }
-
-            // Exact stable log-sum-exp CE, not a probability floor/cap.
-            let nll_loss = (max_l - self.tape.logits[log_off + tgt_id]) + sum_exp.ln();
-            self.tape.losses[t] = nll_loss;
-            total_loss += nll_loss;
         }
-
-        let last_h_off = seq_len * (d_m * d_s);
-        self.h_persistent
-            .copy_from_slice(&self.tape.h_states[last_h_off..last_h_off + d_m * d_s]);
-
-        total_loss / (seq_len as f32)
+        let last = seq_len*d_m*d_s;
+        self.h_persistent.copy_from_slice(&self.tape.h_states[last..last+d_m*d_s]);
+        &self.tape.z_final[..seq_len*d_m]
     }
 
-    // =========================================================================
-    // 3. EXACT TBPTT BACKWARD PASS & ADAMW OPTIMIZATION
-    // =========================================================================
     pub fn zero_gradients(&mut self) {
-        self.embed_w.zero_grad();
-        self.norm_gamma.zero_grad();
-        self.norm_beta.zero_grad();
-        self.a_mat.zero_grad();
-        self.w_delta.zero_grad();
-        self.w_b.zero_grad();
-        self.w_c.zero_grad();
-        self.w_qx.zero_grad();
-        self.w_qh.zero_grad();
-        self.w_gate.zero_grad();
-        self.w_proj.zero_grad();
-        self.adapters[0].zero_grad();
-        self.mlp_w1.zero_grad();
-        self.mlp_w2.zero_grad();
-        self.unembed_w.zero_grad();
+        self.norm_gamma.zero_grad(); self.norm_beta.zero_grad(); self.a_mat.zero_grad();
+        self.w_delta.zero_grad(); self.w_b.zero_grad(); self.w_c.zero_grad();
+        self.w_qx.zero_grad(); self.w_qh.zero_grad(); self.w_gate.zero_grad(); self.w_proj.zero_grad();
+        self.adapters[0].zero_grad(); self.mlp_w1.zero_grad(); self.mlp_w2.zero_grad();
     }
 
-    pub fn backward_chunk(&mut self, seq_len: usize, accumulation_scale: f32) {
-        assert!(
-            seq_len > 0 && seq_len <= self.cfg.chunk_len,
-            "backward sequence length must be within tape capacity"
-        );
-        assert!(accumulation_scale.is_finite());
+    /// Reverse-mode block VJP. External output adjoints are consumed without scaling.
+    /// Returned raw-input adjoints use the same row-major `[time, latent]` layout.
+    pub fn backward_chunk(&mut self, output_adjoints: &[f32], seq_len: usize, input_adjoints: &mut [f32]) {
+        assert!(seq_len > 0 && seq_len <= self.cfg.chunk_len);
         let d_m = self.cfg.d_latent;
+        assert_eq!(output_adjoints.len(), seq_len*d_m);
+        assert_eq!(input_adjoints.len(), seq_len*d_m);
         let d_s = self.cfg.d_state;
         let d_k = self.cfg.d_mem_key;
-        let d_v = self.cfg.d_vocab;
         let d_mlp = d_m * 2;
         let rank = self.adapters[0].rank;
-        let scale_loss = accumulation_scale / (seq_len as f32);
         let ssm_scale = 1.0 / (d_s as f32).sqrt();
-        let logit_scale = 1.0 / (d_m as f32).sqrt();
-
-        let pending_step = self.step_counter + 1;
-        for t in 0..seq_len {
-            self.embed_row_marks[self.tape.x_ids[t]] = pending_step;
-        }
-
         self.grad_h_next.fill(0.0);
-
-        // Reverse Time Loop across sequence chunk L
         for t in (0..seq_len).rev() {
-            let x_id = self.tape.x_ids[t];
-            let tgt_id = self.tape.target_ids[t];
-            let z_off = t * d_m;
-            let log_off = t * d_v;
-
-            // 1. Exact full-vocabulary cross-entropy adjoint.  Every class
-            // contributes, including arbitrarily small non-target probabilities.
-            self.grad_z_final.fill(0.0);
-            for i in 0..d_v {
-                let indicator = if i == tgt_id { 1.0 } else { 0.0 };
-                let g_logit = (self.tape.probs[log_off + i] - indicator) * scale_loss * logit_scale;
-                let row_off = i * d_m;
-                for j in 0..d_m {
-                    self.grad_z_final[j] += g_logit * self.unembed_w.data[row_off + j];
-                    self.unembed_w.grad[row_off + j] += g_logit * self.tape.z_final[z_off + j];
-                }
-            }
-
+            let z_off = t*d_m;
+            self.grad_z_final.copy_from_slice(&output_adjoints[z_off..z_off+d_m]);
             // 2. SiLU MLP Backward
             let mlp_off = t * d_mlp;
             self.mlp_w2
@@ -1189,69 +1034,199 @@ impl PSSALayerV2 {
                 }
             }
 
-            // 6. Affine RMSNorm Backward to Gamma, Beta, and Input Embeddings
+            // Affine RMSNorm VJP to the caller's raw continuous row.
             let inv_rms = self.tape.inv_rms[t];
-            let e_t = &self.embed_w.data[x_id * d_m..(x_id + 1) * d_m];
-
-            let mut dot_gx_e = 0.0f32;
+            let raw = &self.tape.x_raw[t*d_m..(t+1)*d_m];
+            let mut dot_gx_raw = 0.0f32;
             for i in 0..d_m {
                 let gx_i = self.grad_x_norm[i];
                 self.norm_beta.grad[i] += gx_i;
-                self.norm_gamma.grad[i] += gx_i * (e_t[i] * inv_rms);
-
-                let g_unnorm = gx_i * self.norm_gamma.data[i];
-                dot_gx_e += g_unnorm * e_t[i];
+                self.norm_gamma.grad[i] += gx_i * (raw[i] * inv_rms);
+                dot_gx_raw += gx_i * self.norm_gamma.data[i] * raw[i];
             }
-
-            let emb_row_off = x_id * d_m;
             for i in 0..d_m {
                 let g_unnorm = self.grad_x_norm[i] * self.norm_gamma.data[i];
-                let g_e_i =
-                    inv_rms * (g_unnorm - e_t[i] * (dot_gx_e * inv_rms * inv_rms / (d_m as f32)));
-                self.embed_w.grad[emb_row_off + i] += g_e_i;
+                input_adjoints[z_off+i] = inv_rms * (g_unnorm - raw[i] * (dot_gx_raw * inv_rms * inv_rms / d_m as f32));
             }
         }
     }
 
-    pub fn apply_adamw(&mut self, lr: f32) {
-        self.step_counter += 1;
-        let beta1 = self.cfg.beta1;
-        let beta2 = self.cfg.beta2;
-        let wd = self.cfg.weight_decay;
-        let eps = self.cfg.eps;
-        let step = self.step_counter;
-
-        // Dense AdamW semantics: zero-gradient embedding rows still decay their
-        // moments and receive decoupled weight decay on every optimizer step.
-        self.embed_w.step_adamw(lr, beta1, beta2, wd, eps, step);
-        self.norm_gamma.step_adamw(lr, beta1, beta2, 0.0, eps, step);
-        self.norm_beta.step_adamw(lr, beta1, beta2, 0.0, eps, step);
-        self.a_mat.step_adamw(lr, beta1, beta2, wd, eps, step);
-        self.w_delta.step_adamw(lr, beta1, beta2, wd, eps, step);
-        self.w_b.step_adamw(lr, beta1, beta2, wd, eps, step);
-        self.w_c.step_adamw(lr, beta1, beta2, wd, eps, step);
-        self.w_qx.step_adamw(lr, beta1, beta2, wd, eps, step);
-        self.w_qh.step_adamw(lr, beta1, beta2, wd, eps, step);
-        self.w_gate.step_adamw(lr, beta1, beta2, wd, eps, step);
-        self.w_proj.step_adamw(lr, beta1, beta2, wd, eps, step);
-        self.adapters[0].step_adamw(lr, beta1, beta2, wd, eps, step);
-        self.mlp_w1.step_adamw(lr, beta1, beta2, wd, eps, step);
-        self.mlp_w2.step_adamw(lr, beta1, beta2, wd, eps, step);
-        self.unembed_w.step_adamw(lr, beta1, beta2, wd, eps, step);
+    pub fn apply_adamw(&mut self, lr: f32, beta1: f32, beta2: f32, wd: f32, eps: f32, step: usize) {
+        self.norm_gamma.step_adamw(lr,beta1,beta2,0.0,eps,step);
+        self.norm_beta.step_adamw(lr,beta1,beta2,0.0,eps,step);
+        self.a_mat.step_adamw(lr,beta1,beta2,wd,eps,step);
+        self.w_delta.step_adamw(lr,beta1,beta2,wd,eps,step);
+        self.w_b.step_adamw(lr,beta1,beta2,wd,eps,step);
+        self.w_c.step_adamw(lr,beta1,beta2,wd,eps,step);
+        self.w_qx.step_adamw(lr,beta1,beta2,wd,eps,step);
+        self.w_qh.step_adamw(lr,beta1,beta2,wd,eps,step);
+        self.w_gate.step_adamw(lr,beta1,beta2,wd,eps,step);
+        self.w_proj.step_adamw(lr,beta1,beta2,wd,eps,step);
+        self.adapters[0].step_adamw(lr,beta1,beta2,wd,eps,step);
+        self.mlp_w1.step_adamw(lr,beta1,beta2,wd,eps,step);
+        self.mlp_w2.step_adamw(lr,beta1,beta2,wd,eps,step);
     }
 
-    pub fn backward_and_step_chunk(&mut self, seq_len: usize) {
-        self.zero_gradients();
-        self.backward_chunk(seq_len, 1.0);
-        self.apply_adamw(self.cfg.lr);
+    pub fn ema_consolidate_plasticity(&mut self) { self.adapters[0].consolidate(self.cfg.ema_alpha); }
+}
+impl PSSALayerV2 {
+    pub const MAX_DEPTH: usize = 32;
+
+    pub fn new(cfg: PSSAConfigV2, seed: u64) -> Self { Self::new_with_device(cfg, seed, Device::Cpu) }
+    pub fn new_with_device(cfg: PSSAConfigV2, seed: u64, device: Device) -> Self {
+        Self::new_with_depth_and_device(cfg, seed, 1, device)
+    }
+    pub fn new_with_depth(cfg: PSSAConfigV2, seed: u64, depth: usize) -> Self {
+        Self::new_with_depth_and_device(cfg, seed, depth, Device::Cpu)
+    }
+    fn new_with_depth_and_device(cfg: PSSAConfigV2, seed: u64, depth: usize, device: Device) -> Self {
+        cfg.validate();
+        assert!((1..=Self::MAX_DEPTH).contains(&depth), "depth must be in 1..={}", Self::MAX_DEPTH);
+        assert!(!device.is_gpu(), "Device::Gpu is not dispatched by PSSALayerV2; use Device::Cpu");
+        // This is deliberately checked before any vectors are allocated.  It is
+        // conservative (one complete legacy allocation per layer), and therefore
+        // includes every additional block tape, backward scratch and activation.
+        let base = model_allocation_estimate(&cfg).expect("model allocation overflow");
+        let total = base.checked_mul(depth).expect("stacked model allocation overflow");
+        assert!(total <= 1024 * 1024 * 1024, "stacked model allocation exceeds 1 GiB cap");
+        let mut rng = SimpleRng::new(seed);
+        let d_v=cfg.d_vocab; let d_m=cfg.d_latent; let l=cfg.chunk_len;
+        // Keep the exact old draw order for depth one.  Extra layers begin only
+        // after the old embedding/block/head sequence has completed.
+        let embed_w=ParamMatrix::random_xavier(d_v,d_m,&mut rng);
+        let block=PSSAContinuousBlockV2::new_with_rng(PSSAContinuousConfigV2::from(&cfg),&mut rng);
+        let unembed_w=ParamMatrix::random_xavier(d_v,d_m,&mut rng);
+        let mut extra_blocks=Vec::with_capacity(depth-1);
+        for _ in 1..depth { extra_blocks.push(PSSAContinuousBlockV2::new_with_rng(PSSAContinuousConfigV2::from(&cfg),&mut rng)); }
+        let scale=1.0/(depth as f32).sqrt();
+        Self { cfg, step_counter:0, device, rng, vocabulary:Vec::new(), tokenizer_json:None,
+            embed_w, block, extra_blocks, residual_scales:vec![scale;depth-1], unembed_w,
+            tape:ModelEndpointTapeV2::new(l,d_v), embed_row_marks:vec![0;d_v],
+            boundary_adjoints:(0..=depth).map(|_|vec![0.0;l*d_m]).collect(),
+            continuous_inputs:vec![0.0;l*d_m], output_adjoints:vec![0.0;l*d_m], input_adjoints:vec![0.0;l*d_m],
+            residual_block_adjoints:vec![0.0;l*d_m], residual_input_adjoints:vec![0.0;l*d_m],
+            layer_activations:(0..depth-1).map(|_|vec![0.0;l*d_m]).collect(),
+            inf_features:vec![0.0;d_m], inf_z_final:vec![0.0;d_m], inf_block_out:vec![0.0;d_m] }
+    }
+    pub fn depth(&self) -> usize { self.extra_blocks.len()+1 }
+    pub fn reset_recurrent_state(&mut self) {
+        self.block.reset_recurrent_state();
+        for b in &mut self.extra_blocks { b.reset_recurrent_state(); }
     }
 
-    // =========================================================================
-    // 4. EMA CONSOLIDATION (THE SLEEP PHASE)
-    // =========================================================================
-    pub fn ema_consolidate_plasticity(&mut self) {
-        // SiLU(Dx) is nonlinear, so U*D cannot be merged into the MLP without
-        // changing the function. Transfer coefficients inside the adapter instead.
-        self.adapters[0].consolidate(self.cfg.ema_alpha);
+    #[inline(always)]
+    pub fn forward_inference(&mut self, x_id: usize, logits_out: &mut [f32]) {
+        assert!(x_id < self.cfg.d_vocab); assert_eq!(logits_out.len(),self.cfg.d_vocab);
+        let d_m=self.cfg.d_latent;
+        self.inf_features.copy_from_slice(&self.embed_w.data[x_id*d_m..(x_id+1)*d_m]);
+        self.block.forward_continuous_inference(&self.inf_features,&mut self.inf_z_final);
+        for (index, b) in self.extra_blocks.iter_mut().enumerate() {
+            b.forward_continuous_inference(&self.inf_z_final, &mut self.inf_block_out);
+            let scale=self.residual_scales[index];
+            for i in 0..d_m { self.inf_features[i]=self.inf_z_final[i]+scale*self.inf_block_out[i]; }
+            self.inf_z_final.copy_from_slice(&self.inf_features);
+        }
+        self.unembed_w.matvec(&self.inf_z_final,logits_out);
+        let scale=1.0/(d_m as f32).sqrt(); for x in logits_out { *x *= scale; }
     }
+
+    pub fn forward_train_chunk(&mut self, token_ids: &[usize], target_ids: &[usize]) -> f32 {
+        assert!(!token_ids.is_empty(),"training chunk must be nonempty");
+        assert_eq!(token_ids.len(),target_ids.len(),"token and target counts must match");
+        let seq_len=token_ids.len().min(self.cfg.chunk_len);
+        assert!(token_ids[..seq_len].iter().chain(&target_ids[..seq_len]).all(|&x|x<self.cfg.d_vocab),"token IDs must be in vocabulary");
+        self.tape.x_ids[..seq_len].copy_from_slice(&token_ids[..seq_len]); self.tape.target_ids[..seq_len].copy_from_slice(&target_ids[..seq_len]);
+        let d_m=self.cfg.d_latent; let d_v=self.cfg.d_vocab;
+        for t in 0..seq_len { let id=token_ids[t]; self.continuous_inputs[t*d_m..(t+1)*d_m].copy_from_slice(&self.embed_w.data[id*d_m..(id+1)*d_m]); }
+        self.block.forward_train_chunk(&self.continuous_inputs[..seq_len*d_m],seq_len);
+        for layer in 0..self.extra_blocks.len() {
+            if layer == 0 {
+                let previous=&self.block.tape.z_final[..seq_len*d_m];
+                self.extra_blocks[layer].forward_train_chunk(previous,seq_len);
+                let branch=&self.extra_blocks[layer].tape.z_final[..seq_len*d_m]; let out=&mut self.layer_activations[layer][..seq_len*d_m]; let scale=self.residual_scales[layer];
+                for i in 0..seq_len*d_m { out[i]=previous[i]+scale*branch[i]; }
+            } else {
+                let (prior, after)=self.layer_activations.split_at_mut(layer);
+                let previous=&prior[layer-1][..seq_len*d_m];
+                self.extra_blocks[layer].forward_train_chunk(previous,seq_len);
+                let branch=&self.extra_blocks[layer].tape.z_final[..seq_len*d_m]; let out=&mut after[0][..seq_len*d_m]; let scale=self.residual_scales[layer];
+                for i in 0..seq_len*d_m { out[i]=previous[i]+scale*branch[i]; }
+            }
+        }
+        let final_z: &[f32]=if self.extra_blocks.is_empty() { &self.block.tape.z_final[..seq_len*d_m] } else { &self.layer_activations[self.extra_blocks.len()-1][..seq_len*d_m] };
+        let logit_scale=1.0/(d_m as f32).sqrt(); let mut total_loss=0.0f32;
+        for t in 0..seq_len {
+            let z=&final_z[t*d_m..(t+1)*d_m]; let off=t*d_v; self.unembed_w.matvec(z,&mut self.tape.logits[off..off+d_v]);
+            for i in 0..d_v { self.tape.logits[off+i]*=logit_scale; }
+            let mut max_l=f32::NEG_INFINITY; for i in 0..d_v { max_l=max_l.max(self.tape.logits[off+i]); }
+            let mut sum_exp=0.0f32; for i in 0..d_v { let e=(self.tape.logits[off+i]-max_l).exp(); self.tape.probs[off+i]=e; sum_exp+=e; }
+            let inv=1.0/sum_exp.max(1e-8); for i in 0..d_v { self.tape.probs[off+i]*=inv; }
+            let loss=(max_l-self.tape.logits[off+target_ids[t]])+sum_exp.ln(); self.tape.losses[t]=loss; total_loss+=loss;
+        }
+        total_loss/seq_len as f32
+    }
+    pub fn zero_gradients(&mut self) { self.embed_w.zero_grad(); self.block.zero_gradients(); for b in &mut self.extra_blocks { b.zero_gradients(); } self.unembed_w.zero_grad(); }
+    pub fn backward_chunk(&mut self, seq_len: usize, accumulation_scale: f32) {
+        assert!(seq_len>0 && seq_len<=self.cfg.chunk_len); assert!(accumulation_scale.is_finite());
+        let d_m=self.cfg.d_latent; let d_v=self.cfg.d_vocab; let n=seq_len*d_m;
+        let scale_loss=accumulation_scale/seq_len as f32; let logit_scale=1.0/(d_m as f32).sqrt(); let pending=self.step_counter+1;
+        for t in 0..seq_len { self.embed_row_marks[self.tape.x_ids[t]]=pending; }
+        self.output_adjoints[..n].fill(0.0);
+        let final_z: &[f32]=if self.extra_blocks.is_empty() { &self.block.tape.z_final[..n] } else { &self.layer_activations[self.extra_blocks.len()-1][..n] };
+        for t in (0..seq_len).rev() { let zoff=t*d_m; let loff=t*d_v;
+            for i in 0..d_v { let indicator=if i==self.tape.target_ids[t]{1.0}else{0.0}; let g=(self.tape.probs[loff+i]-indicator)*scale_loss*logit_scale; let row=i*d_m;
+                for j in 0..d_m { self.output_adjoints[zoff+j]+=g*self.unembed_w.data[row+j]; self.unembed_w.grad[row+j]+=g*final_z[zoff+j]; }
+            }
+        }
+        let final_boundary=self.depth(); self.boundary_adjoints[final_boundary][..n].copy_from_slice(&self.output_adjoints[..n]);
+        for layer in (0..self.extra_blocks.len()).rev() {
+            let scale=self.residual_scales[layer];
+            for i in 0..n { self.residual_block_adjoints[i]=self.output_adjoints[i]*scale; }
+            self.extra_blocks[layer].backward_chunk(&self.residual_block_adjoints[..n],seq_len,&mut self.residual_input_adjoints[..n]);
+            for i in 0..n { self.output_adjoints[i]+=self.residual_input_adjoints[i]; }
+            self.boundary_adjoints[layer+1][..n].copy_from_slice(&self.output_adjoints[..n]);
+        }
+        self.block.backward_chunk(&self.output_adjoints[..n],seq_len,&mut self.input_adjoints[..n]);
+        self.boundary_adjoints[0][..n].copy_from_slice(&self.input_adjoints[..n]);
+        for t in (0..seq_len).rev() { let row=self.tape.x_ids[t]*d_m; let off=t*d_m; for j in 0..d_m { self.embed_w.grad[row+j]+=self.input_adjoints[off+j]; } }
+    }
+    pub fn apply_adamw(&mut self, lr:f32) { self.step_counter+=1; let s=self.step_counter; let c=&self.cfg;
+        self.embed_w.step_adamw(lr,c.beta1,c.beta2,c.weight_decay,c.eps,s); self.block.apply_adamw(lr,c.beta1,c.beta2,c.weight_decay,c.eps,s);
+        for b in &mut self.extra_blocks { b.apply_adamw(lr,c.beta1,c.beta2,c.weight_decay,c.eps,s); }
+        self.unembed_w.step_adamw(lr,c.beta1,c.beta2,c.weight_decay,c.eps,s); }
+    pub fn backward_and_step_chunk(&mut self, seq_len:usize) { self.zero_gradients(); self.backward_chunk(seq_len,1.0); self.apply_adamw(self.cfg.lr); }
+    pub fn ema_consolidate_plasticity(&mut self) { self.block.ema_consolidate_plasticity(); for b in &mut self.extra_blocks { b.ema_consolidate_plasticity(); } }
+    /// Maintains the established surprise threshold for every layer independently.
+    pub fn insert_training_memory(&mut self, loss:f32, seq_len:usize) {
+        assert!(seq_len>0 && seq_len<=self.cfg.chunk_len);
+        if !(loss>3.5) { return; }
+        let last=seq_len-1; let step=self.step_counter;
+        fn insert(b:&mut PSSAContinuousBlockV2,last:usize,step:usize,loss:f32) { let k=b.cfg.d_mem_key; let m=b.cfg.d_latent;
+            b.inf_q_pnc[..k].copy_from_slice(&b.tape.q_poincare[last*k..(last+1)*k]);
+            b.inf_z_raw[..m].copy_from_slice(&b.tape.z_final[last*m..(last+1)*m]);
+            let mut key=[0.0f32; 0]; // keeps the following split borrows visibly disjoint to the compiler
+            let _=&mut key;
+            let (q, v)=(&b.inf_q_pnc[..k], &b.inf_z_raw[..m]); b.memory.insert_protected(q,v,loss,step); }
+        insert(&mut self.block,last,step,loss); for b in &mut self.extra_blocks { insert(b,last,step,loss); }
+    }
+    pub fn parameter_count(&self) -> usize {
+        fn block(b:&PSSAContinuousBlockV2)->usize { b.norm_gamma.data.len()+b.norm_beta.data.len()+b.a_mat.data.len()+b.w_delta.data.len()+b.w_b.data.len()+b.w_c.data.len()+b.w_qx.data.len()+b.w_qh.data.len()+b.w_gate.data.len()+b.w_proj.data.len()+b.adapters.iter().map(|a|a.down_proj.data.len()+a.up_proj.data.len()).sum::<usize>()+b.mlp_w1.data.len()+b.mlp_w2.data.len() }
+        self.embed_w.data.len()+self.unembed_w.data.len()+block(&self.block)+self.extra_blocks.iter().map(block).sum::<usize>()
+    }
+    pub fn all_parameters_finite(&self) -> bool {
+        fn p(x:&ParamMatrix)->bool { x.data.iter().chain(&x.grad).chain(&x.m).chain(&x.v).all(|v|v.is_finite()) }
+        fn v(x:&ParamVector)->bool { x.data.iter().chain(&x.grad).chain(&x.m).chain(&x.v).all(|z|z.is_finite()) }
+        fn b(x:&PSSAContinuousBlockV2)->bool { v(&x.norm_gamma)&&v(&x.norm_beta)&&p(&x.a_mat)&&p(&x.w_delta)&&p(&x.w_b)&&p(&x.w_c)&&p(&x.w_qx)&&p(&x.w_qh)&&p(&x.w_gate)&&p(&x.w_proj)&&p(&x.mlp_w1)&&p(&x.mlp_w2)&&x.adapters.iter().all(|a|p(&a.down_proj)&&p(&a.up_proj)&&a.consolidated_up.iter().all(|z|z.is_finite())) }
+        p(&self.embed_w)&&p(&self.unembed_w)&&b(&self.block)&&self.extra_blocks.iter().all(b)
+    }
+}
+
+fn model_allocation_estimate(c:&PSSAConfigV2)->Option<usize> {
+    // A checked conservative construction guard.  Four copies cover parameter
+    // data/grad/moments and the remaining terms cover persistent/tape/scratch.
+    let m=c.d_latent; let v=c.d_vocab; let s=c.d_state; let k=c.d_mem_key; let cap=c.mem_capacity; let l=c.chunk_len;
+    let mut n=v.checked_mul(m)?.checked_mul(8)?; // shared endpoint params+tapes
+    let block=m.checked_mul(s)?.checked_mul(2)?.checked_add(m.checked_mul(m)?.checked_mul(14)?)?.checked_add(s.checked_mul(m)?.checked_mul(2)?)?.checked_add(k.checked_mul(m)?.checked_mul(2)?)?.checked_add(cap.checked_mul(k.checked_add(m)?)?)?.checked_add(l.checked_mul(m.checked_mul(s.checked_add(18)?)?.checked_add(k)?.checked_add(cap)?.checked_add(64)?)?)?;
+    n=n.checked_add(block.checked_mul(4)?)?;
+    n.checked_mul(4)
 }
