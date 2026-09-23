@@ -294,6 +294,90 @@ impl WgpuContext {
 
         result
     }
+
+    /// Run the embedded tiled GEMM kernel on the GPU.
+    /// X is [batch, M, K] row-major, W is [N, K] row-major, output is [batch, M, N].
+    pub fn dispatch_gemm(
+        &self,
+        x: &[f32],
+        w: &[f32],
+        m: usize,
+        n: usize,
+        k: usize,
+        batch: usize,
+    ) -> Vec<f32> {
+        assert_eq!(x.len(), batch * m * k, "X buffer length mismatch");
+        assert_eq!(w.len(), n * k, "W buffer length mismatch");
+        let out_len = batch * m * n;
+
+        let cfg: [u32; 4] = [m as u32, n as u32, k as u32, batch as u32];
+        let cfg_buf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("gemm_uniforms"),
+                contents: bytemuck::cast_slice(&cfg),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            });
+        let x_buf = self.create_buffer_init("gemm_x", x, true);
+        let w_buf = self.create_buffer_init("gemm_w", w, true);
+        let y_buf = self.create_buffer_init("gemm_y", &vec![0.0f32; out_len], false);
+
+        let layout = self.gemm_pipeline.get_bind_group_layout(0);
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("gemm_bind_group"),
+            layout: &layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: cfg_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: x_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: w_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: y_buf.as_entire_binding() },
+            ],
+        });
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("gemm_encoder"),
+            });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("gemm_pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.gemm_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            let gx = ((n + 15) / 16) as u32;
+            let gy = ((m + 15) / 16) as u32;
+            pass.dispatch_workgroups(gx.max(1), gy.max(1), (batch as u32).max(1));
+        }
+        self.queue.submit(Some(encoder.finish()));
+
+        self.read_buffer_blocking(&y_buf, out_len)
+    }
+}
+
+/// Reference CPU GEMM with identical layout, used to verify the GPU kernel.
+pub fn gemm_cpu_reference(
+    x: &[f32],
+    w: &[f32],
+    m: usize,
+    n: usize,
+    k: usize,
+    batch: usize,
+) -> Vec<f32> {
+    let mut y = vec![0.0f32; batch * m * n];
+    for b in 0..batch {
+        for i in 0..m {
+            for j in 0..n {
+                let mut acc = 0.0f32;
+                for kk in 0..k {
+                    acc += x[b * m * k + i * k + kk] * w[j * k + kk];
+                }
+                y[b * m * n + i * n + j] = acc;
+            }
+        }
+    }
+    y
 }
 
 // =============================================================================
@@ -309,6 +393,12 @@ pub enum Device {
 impl Device {
     pub fn is_gpu(&self) -> bool {
         matches!(self, Device::Gpu(_))
+    }
+
+    /// Try to bring up a real WebGPU compute device. Returns Err with the
+    /// adapter-level reason when no GPU is usable on this machine.
+    pub fn try_gpu() -> Result<Device, String> {
+        WgpuContext::init_blocking().map(Device::Gpu)
     }
 }
 
