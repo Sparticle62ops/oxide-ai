@@ -25,6 +25,8 @@ pub struct TrainingOptions {
     pub vocab_size: usize,
     /// Continue training from an existing checkpoint instead of fresh initialization.
     pub resume: Option<String>,
+    /// Skip this many encoded tokens from the front of the corpus before training.
+    pub skip_tokens: usize,
 }
 impl Default for TrainingOptions {
     fn default() -> Self {
@@ -40,6 +42,7 @@ impl Default for TrainingOptions {
             warmup_steps: 0,
             seed: 42,
             max_tokens: None,
+            skip_tokens: 0,
             tokenizer: TokenizerKind::Bpe,
             vocab_size: 2048,
             resume: None,
@@ -181,6 +184,7 @@ impl CLIHandler {
             tokenizer,
             vocab_size: parsed.usize_nonzero("--vocab-size", "", 2048)?,
             resume: parsed.string("--resume", "").map(str::to_string),
+            skip_tokens: parsed.required_usize("--skip-tokens", "", 0)?,
         };
         if !(x.lr > 0.0) {
             return Err("--lr must be positive".into());
@@ -198,24 +202,51 @@ impl CLIHandler {
         raw: &str,
         tokenizer: &Tokenizer,
         limit: Option<usize>,
+        skip: usize,
     ) -> Result<Vec<Vec<usize>>, String> {
         let mut docs = Vec::new();
         let mut remaining = limit.unwrap_or(usize::MAX);
+        // Wrap the offset so a chained walk can run past the end of the corpus and
+        // come back around to the front instead of failing.
+        let mut to_skip = skip;
+        if to_skip > 0 {
+            let mut total = 0usize;
+            for line in raw.lines() {
+                total += tokenizer.try_encode(line, true)?.len();
+            }
+            if total == 0 {
+                return Err("dataset has no token transitions".into());
+            }
+            to_skip %= total;
+        }
         for line in raw.lines() {
             if remaining == 0 {
                 break;
             }
             let mut ids = tokenizer.try_encode(line, true)?;
+            if ids.is_empty() {
+                continue;
+            }
+            if to_skip > 0 {
+                if to_skip >= ids.len() {
+                    to_skip -= ids.len();
+                    continue;
+                }
+                ids.drain(0..to_skip);
+                to_skip = 0;
+            }
+            let clipped = ids.len() > remaining;
             ids.truncate(remaining);
             remaining -= ids.len();
-            if !ids.is_empty() {
-                if ids.len() < 2 {
-                    return Err(
-                        "each nonempty training document must contain at least two tokens".into(),
-                    );
+            if ids.len() < 2 {
+                if clipped || skip > 0 {
+                    continue;
                 }
-                docs.push(ids);
+                return Err(
+                    "each nonempty training document must contain at least two tokens".into(),
+                );
             }
+            docs.push(ids);
         }
         if docs.is_empty() {
             Err("dataset has no token transitions".into())
@@ -293,7 +324,7 @@ impl CLIHandler {
                 (model, tokenizer)
             }
         };
-        let docs = Self::documents(raw, &tokenizer, options.max_tokens)?;
+        let docs = Self::documents(raw, &tokenizer, options.max_tokens, options.skip_tokens)?;
         let mut plan = Vec::<(usize, usize, usize)>::new();
         for (doc_id, doc) in docs.iter().enumerate() {
             let mut start = 0;
@@ -484,7 +515,7 @@ impl CLIHandler {
         tokenizer: &Tokenizer,
         raw: &str,
     ) -> Result<(f64, usize, usize, usize), String> {
-        let docs = Self::documents(raw, tokenizer, None)?;
+        let docs = Self::documents(raw, tokenizer, None, 0)?;
         let mut loss = 0.0f64;
         let mut tokens = 0usize;
         let mut correct = 0usize;
@@ -589,6 +620,7 @@ impl CLIHandler {
             warmup_steps: 4,
             seed: 7,
             max_tokens: None,
+            skip_tokens: 0,
             tokenizer: TokenizerKind::Word,
             vocab_size: 2048,
             resume: None,
@@ -619,7 +651,7 @@ impl CLIHandler {
     }
     pub fn print_help() {
         println!(
-            "Usage: oxide <command> [options]\nCommands: train, generate, evaluate, chat, download, benchmark\ntrain [source] [-d|--data source] [-o|--out path] [--tokenizer bpe|word --vocab-size 2048] [-e|--epochs n] [--latent n --state n --key n --memory n --chunk n --lr f --accumulate n --warmup-steps n --seed n --max-tokens n] [--resume path]\ngenerate <prompt> [-p|--prompt text] [-m|--model path] [-d|--data source] [-t|--temp f] [--max-new-tokens n]\nevaluate -m|--model path -d|--data source\nDefault training is byte-level BPE (2048 maximum vocabulary). --data is only a legacy-word provenance check for generation; V7 BPE restores embedded tokenizer metadata. --max-tokens is a global training-corpus cap."
+            "Usage: oxide <command> [options]\nCommands: train, generate, evaluate, chat, download, benchmark\ntrain [source] [-d|--data source] [-o|--out path] [--tokenizer bpe|word --vocab-size 2048] [-e|--epochs n] [--latent n --state n --key n --memory n --chunk n --lr f --accumulate n --warmup-steps n --seed n --max-tokens n --skip-tokens n] [--resume path]\ngenerate <prompt> [-p|--prompt text] [-m|--model path] [-d|--data source] [-t|--temp f] [--max-new-tokens n]\nevaluate -m|--model path -d|--data source\nDefault training is byte-level BPE (2048 maximum vocabulary). --data is only a legacy-word provenance check for generation; V7 BPE restores embedded tokenizer metadata. --max-tokens is a global training-corpus cap; --skip-tokens drops that many encoded tokens from the front first, so chained runs can walk the whole corpus."
         );
     }
     pub fn parse_and_execute(args: Vec<String>) -> Result<(), String> {
@@ -655,6 +687,7 @@ impl CLIHandler {
                         "--tokenizer",
                         "--vocab-size",
                         "--resume",
+                        "--skip-tokens",
                     ],
                 )?;
                 if p.positional.len() > 1 {

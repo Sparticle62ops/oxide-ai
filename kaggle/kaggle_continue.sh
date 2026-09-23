@@ -8,6 +8,9 @@ REPO="${REPO:-https://github.com/Sparticle62ops/oxide-ai.git}"
 WORK="${WORK:-/kaggle/working}"
 BRANCH="${BRANCH:-main}"
 TOTAL="${TOTAL:-8}"
+# Each link reads a different WINDOW-sized slice instead of the same prefix, so the
+# chain walks the whole corpus. The offset wraps around at the end of the file.
+WINDOW="${WINDOW:-200000}"
 
 source "$HOME/.cargo/env" 2>/dev/null || true
 if ! command -v cargo >/dev/null 2>&1; then
@@ -55,11 +58,12 @@ fi
 
 for i in $(seq "$START" "$TOTAL"); do
   OUT="$WORK/chain/ck$(printf '%02d' "$i").pssa"
-  echo "--- ck$(printf '%02d' "$i") ---"
+  SKIP=$(( (i - 1) * WINDOW ))
+  echo "--- ck$(printf '%02d' "$i") (corpus offset $SKIP) ---"
   if [ -z "$PREV" ]; then
-    ./target/release/oxide_ai_pssa train data/downloaded.txt -o "$OUT" --max-tokens 200000 -e 1
+    ./target/release/oxide_ai_pssa train data/downloaded.txt -o "$OUT" --max-tokens "$WINDOW" --skip-tokens "$SKIP" -e 1
   else
-    ./target/release/oxide_ai_pssa train data/downloaded.txt -o "$OUT" --max-tokens 200000 -e 1 --resume "$PREV"
+    ./target/release/oxide_ai_pssa train data/downloaded.txt -o "$OUT" --max-tokens "$WINDOW" --skip-tokens "$SKIP" -e 1 --resume "$PREV"
   fi
   PREV="$OUT"
 done
