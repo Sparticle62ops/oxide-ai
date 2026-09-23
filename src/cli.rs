@@ -22,6 +22,8 @@ pub struct TrainingOptions {
     pub max_tokens: Option<usize>,
     pub tokenizer: TokenizerKind,
     pub vocab_size: usize,
+    /// Continue training from an existing checkpoint instead of fresh initialization.
+    pub resume: Option<String>,
 }
 impl Default for TrainingOptions {
     fn default() -> Self {
@@ -39,6 +41,7 @@ impl Default for TrainingOptions {
             max_tokens: None,
             tokenizer: TokenizerKind::Bpe,
             vocab_size: 2048,
+            resume: None,
         }
     }
 }
@@ -176,6 +179,7 @@ impl CLIHandler {
                 .transpose()?,
             tokenizer,
             vocab_size: parsed.usize_nonzero("--vocab-size", "", 2048)?,
+            resume: parsed.string("--resume", "").map(str::to_string),
         };
         if !(x.lr > 0.0) {
             return Err("--lr must be positive".into());
@@ -243,25 +247,52 @@ impl CLIHandler {
         raw: &str,
         options: &TrainingOptions,
     ) -> Result<(PSSALayerV2, Tokenizer), String> {
-        let tokenizer = match options.tokenizer {
-            TokenizerKind::Word => Tokenizer::from_corpus(raw, true),
-            TokenizerKind::Bpe => Tokenizer::from_corpus_bpe(raw, options.vocab_size)?,
+        let (mut model, tokenizer) = match options.resume.as_deref() {
+            Some(path) => {
+                let loaded = checkpoint::load_checkpoint(path)
+                    .map_err(|e| format!("cannot resume from '{path}': {e}"))?;
+                let model = loaded.model;
+                if model.vocabulary.is_empty() {
+                    return Err("resume checkpoint lacks vocabulary provenance".into());
+                }
+                let tokenizer = match &model.tokenizer_json {
+                    Some(json) => Tokenizer::from_serialized(json)?,
+                    None => Tokenizer::from_vocabulary(&model.vocabulary)?,
+                };
+                if tokenizer.vocab_size != model.cfg.d_vocab
+                    || tokenizer.ordered_vocabulary()? != model.vocabulary
+                {
+                    return Err("resume checkpoint tokenizer/vocabulary mismatch".into());
+                }
+                println!(
+                    "resumed_from={path} vocab={} d_latent={} prior_steps={}",
+                    model.cfg.d_vocab, model.cfg.d_latent, model.step_counter
+                );
+                (model, tokenizer)
+            }
+            None => {
+                let tokenizer = match options.tokenizer {
+                    TokenizerKind::Word => Tokenizer::from_corpus(raw, true),
+                    TokenizerKind::Bpe => Tokenizer::from_corpus_bpe(raw, options.vocab_size)?,
+                };
+                let cfg = PSSAConfigV2 {
+                    d_vocab: tokenizer.vocab_size,
+                    d_latent: options.latent,
+                    d_state: options.state,
+                    d_mem_key: options.key,
+                    mem_capacity: options.memory,
+                    chunk_len: options.chunk,
+                    lr: options.lr,
+                    ..Default::default()
+                };
+                cfg.validate();
+                let mut model = PSSALayerV2::new(cfg, options.seed);
+                model.vocabulary = tokenizer.ordered_vocabulary()?;
+                model.tokenizer_json = tokenizer.serialized_metadata();
+                (model, tokenizer)
+            }
         };
         let docs = Self::documents(raw, &tokenizer, options.max_tokens)?;
-        let cfg = PSSAConfigV2 {
-            d_vocab: tokenizer.vocab_size,
-            d_latent: options.latent,
-            d_state: options.state,
-            d_mem_key: options.key,
-            mem_capacity: options.memory,
-            chunk_len: options.chunk,
-            lr: options.lr,
-            ..Default::default()
-        };
-        cfg.validate();
-        let mut model = PSSALayerV2::new(cfg, options.seed);
-        model.vocabulary = tokenizer.ordered_vocabulary()?;
-        model.tokenizer_json = tokenizer.serialized_metadata();
         let mut plan = Vec::<(usize, usize, usize)>::new();
         for (doc_id, doc) in docs.iter().enumerate() {
             let mut start = 0;
@@ -559,6 +590,7 @@ impl CLIHandler {
             max_tokens: None,
             tokenizer: TokenizerKind::Word,
             vocab_size: 2048,
+            resume: None,
         };
         let (mut m, tok) = Self::train_corpus(raw, &opts)?;
         let (ce, _, _, _) = Self::evaluate_corpus(&mut m, &tok, raw)?;
@@ -586,7 +618,7 @@ impl CLIHandler {
     }
     pub fn print_help() {
         println!(
-            "Usage: oxide <command> [options]\nCommands: train, generate, evaluate, chat, download, benchmark\ntrain [source] [-d|--data source] [-o|--out path] [--tokenizer bpe|word --vocab-size 2048] [-e|--epochs n] [--latent n --state n --key n --memory n --chunk n --lr f --accumulate n --warmup-steps n --seed n --max-tokens n]\ngenerate <prompt> [-p|--prompt text] [-m|--model path] [-d|--data source] [-t|--temp f] [--max-new-tokens n]\nevaluate -m|--model path -d|--data source\nDefault training is byte-level BPE (2048 maximum vocabulary). --data is only a legacy-word provenance check for generation; V7 BPE restores embedded tokenizer metadata. --max-tokens is a global training-corpus cap."
+            "Usage: oxide <command> [options]\nCommands: train, generate, evaluate, chat, download, benchmark\ntrain [source] [-d|--data source] [-o|--out path] [--tokenizer bpe|word --vocab-size 2048] [-e|--epochs n] [--latent n --state n --key n --memory n --chunk n --lr f --accumulate n --warmup-steps n --seed n --max-tokens n] [--resume path]\ngenerate <prompt> [-p|--prompt text] [-m|--model path] [-d|--data source] [-t|--temp f] [--max-new-tokens n]\nevaluate -m|--model path -d|--data source\nDefault training is byte-level BPE (2048 maximum vocabulary). --data is only a legacy-word provenance check for generation; V7 BPE restores embedded tokenizer metadata. --max-tokens is a global training-corpus cap."
         );
     }
     pub fn parse_and_execute(args: Vec<String>) -> Result<(), String> {
@@ -621,6 +653,7 @@ impl CLIHandler {
                         "--max-tokens",
                         "--tokenizer",
                         "--vocab-size",
+                        "--resume",
                     ],
                 )?;
                 if p.positional.len() > 1 {
