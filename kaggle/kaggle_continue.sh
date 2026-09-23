@@ -10,6 +10,12 @@ BRANCH="${BRANCH:-main}"
 TOTAL="${TOTAL:-8}"
 
 source "$HOME/.cargo/env" 2>/dev/null || true
+if ! command -v cargo >/dev/null 2>&1; then
+  echo "### 0. Rust toolchain (clean container)"
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+  source "$HOME/.cargo/env"
+fi
+cargo --version
 
 echo "### 1. Update checkout to $BRANCH"
 if [ -d "$WORK/oxide-ai/.git" ]; then
