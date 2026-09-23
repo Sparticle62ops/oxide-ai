@@ -9,7 +9,7 @@
 # or paste the body into a cell prefixed with %%bash.
 set -euo pipefail
 
-BRANCH="${BRANCH:-feature/wgpu-wiring}"
+BRANCH="${BRANCH:-main}"
 REPO="${REPO:-https://github.com/Sparticle62ops/oxide-ai.git}"
 WORK="${WORK:-/kaggle/working}"
 
