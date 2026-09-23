@@ -1,6 +1,7 @@
 use crate::checkpoint::{self, CheckpointFormat};
 use crate::dataset::{DatasetManager, Tokenizer, TokenizerKind};
 use crate::inference::{InferenceConfig, PSSAInferenceEngine};
+use crate::backend::{gemm_cpu_reference, Device};
 use crate::pssa::{PSSAConfigV2, PSSALayerV2};
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
@@ -743,6 +744,10 @@ impl CLIHandler {
                 )
                 .map_err(|e| e.to_string())
             }
+            "gpu-probe" => {
+                run_gpu_probe();
+                Ok(())
+            }
             "benchmark" => {
                 if args.len() != 2 {
                     return Err("benchmark takes no options".into());
@@ -757,4 +762,67 @@ fn docs_token_count(raw: &str, tokenizer: &Tokenizer) -> Result<usize, String> {
     raw.lines().try_fold(0usize, |n, line| {
         tokenizer.try_encode(line, true).map(|ids| n + ids.len())
     })
+}
+
+/// Bring up the WebGPU compute device, run the embedded tiled GEMM kernel on it,
+/// and check the result against the CPU reference implementation.
+pub fn run_gpu_probe() {
+    println!("=== oxide gpu-probe ===");
+    let device = match Device::try_gpu() {
+        Ok(d) => {
+            println!("adapter: WebGPU compute device acquired");
+            d
+        }
+        Err(e) => {
+            println!("adapter: unavailable ({})", e);
+            println!("result: no GPU on this machine; training stays on CPU");
+            return;
+        }
+    };
+
+    let ctx = match &device {
+        Device::Gpu(ctx) => ctx.clone(),
+        Device::Cpu => {
+            println!("result: CPU device returned; nothing to probe");
+            return;
+        }
+    };
+
+    let (batch, m, n, k) = (2usize, 64usize, 96usize, 128usize);
+    let mut seed = 0x9E3779B97F4A7C15u64;
+    let mut next = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        ((seed >> 40) as f32 / 8_388_608.0) - 1.0
+    };
+    let x: Vec<f32> = (0..batch * m * k).map(|_| next()).collect();
+    let w: Vec<f32> = (0..n * k).map(|_| next()).collect();
+
+    let t_gpu = Instant::now();
+    let y_gpu = ctx.dispatch_gemm(&x, &w, m, n, k, batch);
+    let gpu_ms = t_gpu.elapsed().as_secs_f64() * 1000.0;
+
+    let t_cpu = Instant::now();
+    let y_cpu = gemm_cpu_reference(&x, &w, m, n, k, batch);
+    let cpu_ms = t_cpu.elapsed().as_secs_f64() * 1000.0;
+
+    let mut max_abs = 0.0f32;
+    for (a, b) in y_gpu.iter().zip(y_cpu.iter()) {
+        let d = (a - b).abs();
+        if d > max_abs {
+            max_abs = d;
+        }
+    }
+
+    println!("shape: batch={} M={} N={} K={}", batch, m, n, k);
+    println!("gpu:   {:.3} ms", gpu_ms);
+    println!("cpu:   {:.3} ms", cpu_ms);
+    println!("max_abs_diff: {:.3e}", max_abs);
+    if max_abs < 1e-3 {
+        println!("result: PASS, GPU kernel matches CPU reference");
+    } else {
+        println!("result: FAIL, GPU kernel diverges from CPU reference");
+    }
+    println!("note: layer math is still CPU-dispatched; this proves the device path only");
 }
