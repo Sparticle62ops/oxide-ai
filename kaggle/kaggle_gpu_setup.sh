@@ -51,25 +51,8 @@ echo "### 4. GPU probe"
 ./target/release/oxide_ai_pssa gpu-probe
 
 echo
-echo "### 5. Chained training"
-# --resume lets each run continue the previous checkpoint instead of
-# starting from scratch, so loss accumulates across runs.
-mkdir -p "$WORK/chain"
-PREV=""
-for i in 1 2 3 4 5 6 7 8; do
-  OUT="$WORK/chain/ck$(printf '%02d' "$i").pssa"
-  if [ -z "$PREV" ]; then
-    ./target/release/oxide_ai_pssa train data/downloaded.txt -o "$OUT" --max-tokens 200000 -e 1
-  else
-    ./target/release/oxide_ai_pssa train data/downloaded.txt -o "$OUT" --max-tokens 200000 -e 1 --resume "$PREV"
-  fi
-  PREV="$OUT"
-done
-
-echo
-echo "### 6. Sample"
-./target/release/oxide_ai_pssa generate -m "$PREV" -p "The sun is"
-./target/release/oxide_ai_pssa generate -m "$PREV" -p "Anarchism is"
-
-echo
-echo "Done. Checkpoints are in $WORK/chain and download from the notebook Output tab."
+echo "### 5. Chained training and sample"
+# One code path for the chain: kaggle_continue.sh fetches the large corpus, walks
+# it offset by offset, resumes each link from the previous checkpoint, and samples
+# at the end. Re-running this file later picks up where the chain left off.
+exec bash kaggle/kaggle_continue.sh
