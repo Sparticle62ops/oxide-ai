@@ -95,12 +95,15 @@ mkdir -p "$WORK/chain"
 # previous saved version arrive under /kaggle/input instead. Copy them back in so
 # the chain resumes instead of silently restarting at ck01.
 if ! ls "$WORK/chain"/ck*.pssa >/dev/null 2>&1; then
-  SEED="$(ls -1 /kaggle/input/*/chain/ck*.pssa /kaggle/input/*/ck*.pssa 2>/dev/null | sort | tail -1 || true)"
+  SEED="$(find /kaggle/input -maxdepth 8 -name 'ck*.pssa' 2>/dev/null | sort | tail -1)"
   if [ -n "$SEED" ]; then
     echo "seeding chain from $(dirname "$SEED")"
     cp "$(dirname "$SEED")"/ck*.pssa "$WORK/chain"/
+    ls -1 "$WORK/chain" | tail -3
   else
-    echo "no earlier checkpoints found in /kaggle/input, this will start a fresh chain"
+    echo "no checkpoints found under /kaggle/input. what is mounted:"
+    ls -R /kaggle/input 2>/dev/null | head -40
+    echo "starting a fresh chain"
   fi
 fi
 PREV=""
