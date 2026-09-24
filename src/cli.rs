@@ -3,6 +3,7 @@ use crate::dataset::{DatasetManager, Tokenizer, TokenizerKind};
 use crate::inference::{InferenceConfig, PSSAInferenceEngine};
 use crate::backend::{gemm_cpu_reference, Device};
 use crate::pssa::{PSSAConfigV2, PSSALayerV2};
+use crate::ui;
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use std::time::Instant;
@@ -300,6 +301,11 @@ impl CLIHandler {
                     "resumed_from={path} vocab={} d_latent={} prior_steps={}",
                     model.cfg.d_vocab, model.cfg.d_latent, model.step_counter
                 );
+                ui::success(&format!(
+                    "resumed {} at {} prior optimizer steps",
+                    ui::bold(path),
+                    ui::thousands(model.step_counter as usize)
+                ));
                 (model, tokenizer)
             }
             None => {
@@ -347,8 +353,23 @@ impl CLIHandler {
                 options.warmup_steps
             ));
         }
+        ui::banner("train", "plastic state-space architecture");
+        ui::field("corpus", &format!("{} tokens", ui::thousands(docs.iter().map(Vec::len).sum())));
+        ui::field("vocabulary", &ui::thousands(model.cfg.d_vocab));
+        ui::field("width", &format!("latent {} / state {}", model.cfg.d_latent, model.cfg.d_state));
+        ui::field("memory", &format!("{} slots, key width {}", options.memory, model.cfg.d_mem_key));
+        ui::field("schedule", &format!(
+            "{} epoch(s), {} updates, lr {}",
+            options.epochs,
+            ui::thousands(total_updates),
+            options.lr
+        ));
+        println!();
+
         let started = Instant::now();
         let mut update = 0;
+        let mut tokens_seen = 0usize;
+        let mut progress = ui::Progress::new("training", total_updates);
         for epoch in 0..options.epochs {
             model.reset_recurrent_state();
             let mut loss_sum = 0.0f64;
@@ -393,7 +414,10 @@ impl CLIHandler {
                 if !Self::finite(&model) {
                     return Err("non-finite parameters; training aborted without checkpoint".into());
                 }
+                tokens_seen += total_tokens;
+                progress.update(update, total_tokens, loss_sum / token_sum.max(1) as f64);
             }
+            progress.finish();
             model.ema_consolidate_plasticity();
             println!(
                 "epoch {}/{} loss={:.6} tokens={} updates={}",
@@ -404,10 +428,21 @@ impl CLIHandler {
                 update
             );
         }
+        progress.finish();
+        let wall = started.elapsed().as_secs_f64();
         println!(
             "training_seconds={:.3} optimizer_updates={update}",
             started.elapsed().as_secs_f32()
         );
+        ui::section("summary");
+        ui::field("wall time", &ui::duration(wall));
+        ui::field("tokens", &ui::thousands(tokens_seen));
+        ui::field(
+            "throughput",
+            &format!("{:.0} tokens/second", if wall > 0.0 { tokens_seen as f64 / wall } else { 0.0 }),
+        );
+        ui::field("updates", &ui::thousands(update));
+        println!();
         Ok((model, tokenizer))
     }
 
@@ -417,6 +452,8 @@ impl CLIHandler {
         Self::save_model_v2(&model, out)
             .map_err(|e| format!("cannot save checkpoint '{out}': {e}"))?;
         println!("saved_checkpoint={out}");
+        ui::success(&format!("checkpoint written to {}", ui::bold(out)));
+        println!();
         Ok(())
     }
 
@@ -650,9 +687,78 @@ impl CLIHandler {
         Ok(())
     }
     pub fn print_help() {
+        let bin = "oxide";
+        println!();
         println!(
-            "Usage: oxide <command> [options]\nCommands: train, generate, evaluate, chat, download, benchmark\ntrain [source] [-d|--data source] [-o|--out path] [--tokenizer bpe|word --vocab-size 2048] [-e|--epochs n] [--latent n --state n --key n --memory n --chunk n --lr f --accumulate n --warmup-steps n --seed n --max-tokens n --skip-tokens n] [--resume path]\ngenerate <prompt> [-p|--prompt text] [-m|--model path] [-d|--data source] [-t|--temp f] [--max-new-tokens n]\nevaluate -m|--model path -d|--data source\nDefault training is byte-level BPE (2048 maximum vocabulary). --data is only a legacy-word provenance check for generation; V7 BPE restores embedded tokenizer metadata. --max-tokens is a global training-corpus cap; --skip-tokens drops that many encoded tokens from the front first, so chained runs can walk the whole corpus."
+            "  {}  {}",
+            ui::bold(&ui::cyan("oxide")),
+            ui::dim("plastic state-space architecture, v0.4.0")
         );
+        println!("  {}", ui::dim(&"\u{2500}".repeat(62)));
+        println!();
+        println!("  {}", ui::bold("USAGE"));
+        println!("    {bin} <command> [options]");
+        println!();
+        println!("  {}", ui::bold("COMMANDS"));
+        for (name, blurb) in [
+            ("train", "fit a checkpoint on a text corpus"),
+            ("generate", "continue a prompt with a trained checkpoint"),
+            ("evaluate", "cross entropy, perplexity and accuracy as JSON"),
+            ("chat", "interactive prompt loop against a checkpoint"),
+            ("download", "pull a Hugging Face dataset to a local file"),
+            ("benchmark", "end-to-end smoke test on the built-in corpus"),
+            ("gpu-probe", "check whether a WebGPU compute device is usable"),
+            ("help", "show this message"),
+        ] {
+            println!("    {:<12}{}", ui::cyan(name), ui::dim(blurb));
+        }
+        println!();
+        println!("  {}", ui::bold("TRAIN"));
+        println!("    {bin} train [source] [-d|--data source] [-o|--out path]");
+        println!("    {:<30}{}", "  --tokenizer bpe|word", ui::dim("default bpe"));
+        println!("    {:<30}{}", "  --vocab-size n", ui::dim("byte-level BPE ceiling, default 2048"));
+        println!("    {:<30}{}", "  -e|--epochs n", ui::dim("passes over the selected slice"));
+        println!("    {:<30}{}", "  --latent n --state n", ui::dim("model width and recurrent state size"));
+        println!("    {:<30}{}", "  --key n --memory n", ui::dim("episodic key width and bank capacity"));
+        println!("    {:<30}{}", "  --chunk n --accumulate n", ui::dim("sequence chunk and gradient accumulation"));
+        println!("    {:<30}{}", "  --lr f --warmup-steps n", ui::dim("optimizer schedule"));
+        println!("    {:<30}{}", "  --seed n", ui::dim("deterministic initialisation"));
+        println!("    {:<30}{}", "  --max-tokens n", ui::dim("global cap on training tokens"));
+        println!("    {:<30}{}", "  --skip-tokens n", ui::dim("drop this many tokens from the front first"));
+        println!("    {:<30}{}", "  --resume path", ui::dim("continue from an existing checkpoint"));
+        println!();
+        println!("  {}", ui::bold("GENERATE"));
+        println!("    {bin} generate <prompt> [-m|--model path] [-t|--temp f] [--max-new-tokens n]");
+        println!();
+        println!("  {}", ui::bold("EXAMPLES"));
+        println!("    {}", ui::dim("# train a fresh checkpoint on the first 200k tokens"));
+        println!("    {bin} train data/downloaded.txt -o data/model.pssa --max-tokens 200000 -e 1");
+        println!();
+        println!("    {}", ui::dim("# continue that run on the next slice of the same corpus"));
+        println!("    {bin} train data/downloaded.txt -o data/ck02.pssa \\");
+        println!("      --resume data/model.pssa --max-tokens 200000 --skip-tokens 200000 -e 1");
+        println!();
+        println!("    {}", ui::dim("# sample from the result"));
+        println!("    {bin} generate \"The sun is\" -m data/ck02.pssa --max-new-tokens 64");
+        println!();
+        println!("  {}", ui::bold("NOTES"));
+        println!(
+            "    {}",
+            ui::dim("--skip-tokens plus --max-tokens is how a chain of runs walks a whole corpus")
+        );
+        println!(
+            "    {}",
+            ui::dim("instead of retraining the same prefix every link.")
+        );
+        println!(
+            "    {}",
+            ui::dim("--data on generate is a legacy-word provenance check only; V7 BPE")
+        );
+        println!(
+            "    {}",
+            ui::dim("checkpoints restore their embedded tokenizer metadata.")
+        );
+        println!();
     }
     pub fn parse_and_execute(args: Vec<String>) -> Result<(), String> {
         if args.len() < 2 {

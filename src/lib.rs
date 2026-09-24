@@ -8,4 +8,5 @@ pub mod inference;
 pub mod diagnostics;
 pub mod checkpoint;
 pub mod cli;
+pub mod ui;
 pub mod backend;
