@@ -686,6 +686,149 @@ impl CLIHandler {
         println!("benchmark_pass ce={ce:.6} completion={out}");
         Ok(())
     }
+    /// Everything the project can do, on one screen, with the state of the
+    /// working directory next to it. This is what `oxide` alone prints.
+    pub fn print_home() {
+        ui::clear_screen();
+        ui::logo();
+        println!(
+            "   {}  {}",
+            ui::dim("plastic state-space architecture"),
+            ui::dim("v0.4.0")
+        );
+        println!();
+
+        ui::panel_top("commands");
+        for (name, blurb) in [
+            ("train", "fit a checkpoint on a text corpus"),
+            ("generate", "continue a prompt with a trained checkpoint"),
+            ("chat", "interactive prompt loop against a checkpoint"),
+            ("evaluate", "cross entropy, perplexity and accuracy as JSON"),
+            ("status", "checkpoints and corpora in this directory"),
+            ("download", "pull a Hugging Face dataset to a local file"),
+            ("benchmark", "end-to-end smoke test on the built-in corpus"),
+            ("gpu-probe", "check whether a WebGPU compute device is usable"),
+        ] {
+            ui::panel_row(&format!("{}{}", ui::cyan(&format!("{name:<12}")), ui::dim(blurb)));
+        }
+        ui::panel_bottom();
+        println!();
+
+        Self::workspace_panel();
+        println!();
+        println!(
+            "  {} {}",
+            ui::dim("try"),
+            ui::bold("oxide train data/downloaded.txt -o data/model.pssa --max-tokens 200000 -e 1")
+        );
+        println!("  {}", ui::dim("oxide help for every flag"));
+        println!();
+    }
+
+    /// Checkpoints and corpora found nearby, newest first.
+    fn workspace_panel() {
+        let mut checkpoints: Vec<(String, u64)> = Vec::new();
+        let mut corpora: Vec<(String, u64)> = Vec::new();
+        for dir in [".", "data", "chain", "data/chain"] {
+            let Ok(entries) = std::fs::read_dir(dir) else { continue };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Some(name) = path.to_str() else { continue };
+                let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                let label = name.trim_start_matches("./").to_string();
+                if name.ends_with(".pssa") {
+                    checkpoints.push((label, size));
+                } else if name.ends_with(".txt") && size > 4096 {
+                    corpora.push((label, size));
+                }
+            }
+        }
+        checkpoints.sort();
+        corpora.sort();
+
+        ui::panel_top("workspace");
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        ui::panel_field("device", &format!("cpu, {threads} threads"));
+        if checkpoints.is_empty() {
+            ui::panel_field("checkpoints", &ui::dim("none yet, run oxide train"));
+        } else {
+            let shown = checkpoints.len().min(4);
+            for (i, (name, size)) in checkpoints.iter().take(shown).enumerate() {
+                let label = if i == 0 { "checkpoints" } else { "" };
+                ui::panel_field(label, &format!("{}  {}", name, ui::dim(&ui::bytes(*size))));
+            }
+            if checkpoints.len() > shown {
+                ui::panel_field("", &ui::dim(&format!("+{} more", checkpoints.len() - shown)));
+            }
+        }
+        if corpora.is_empty() {
+            ui::panel_field("corpora", &ui::dim("none found"));
+        } else {
+            for (i, (name, size)) in corpora.iter().take(3).enumerate() {
+                let label = if i == 0 { "corpora" } else { "" };
+                ui::panel_field(label, &format!("{}  {}", name, ui::dim(&ui::bytes(*size))));
+            }
+        }
+        ui::panel_bottom();
+    }
+
+    /// `oxide status`: the workspace panel on its own, plus what each
+    /// checkpoint actually contains.
+    fn run_status() -> Result<(), String> {
+        println!();
+        Self::workspace_panel();
+        let mut described = 0usize;
+        for dir in ["data", "chain", "data/chain", "."] {
+            let Ok(entries) = std::fs::read_dir(dir) else { continue };
+            let mut paths: Vec<String> = entries
+                .flatten()
+                .filter_map(|e| e.path().to_str().map(|s| s.to_string()))
+                .filter(|s| s.ends_with(".pssa"))
+                .collect();
+            paths.sort();
+            for path in paths {
+                if described == 0 {
+                    println!();
+                    ui::panel_top("checkpoint detail");
+                }
+                if described >= 6 {
+                    break;
+                }
+                described += 1;
+                match checkpoint::load_checkpoint(&path) {
+                    Ok(loaded) => {
+                        let m = loaded.model;
+                        ui::panel_row(&ui::bold(path.trim_start_matches("./")));
+                        ui::panel_field(
+                            "  shape",
+                            &format!(
+                                "vocab {} / latent {} / state {}",
+                                ui::thousands(m.cfg.d_vocab),
+                                m.cfg.d_latent,
+                                m.cfg.d_state
+                            ),
+                        );
+                        ui::panel_field(
+                            "  trained",
+                            &format!("{} optimizer steps", ui::thousands(m.step_counter as usize)),
+                        );
+                    }
+                    Err(e) => {
+                        ui::panel_row(&ui::bold(path.trim_start_matches("./")));
+                        ui::panel_field("  unreadable", &ui::dim(&e.to_string()));
+                    }
+                }
+            }
+        }
+        if described > 0 {
+            ui::panel_bottom();
+        }
+        println!();
+        Ok(())
+    }
+
     pub fn print_help() {
         let bin = "oxide";
         println!();
@@ -762,7 +905,7 @@ impl CLIHandler {
     }
     pub fn parse_and_execute(args: Vec<String>) -> Result<(), String> {
         if args.len() < 2 {
-            Self::print_help();
+            Self::print_home();
             return Ok(());
         }
         match args[1].as_str() {
@@ -882,6 +1025,12 @@ impl CLIHandler {
                     text,
                 )
                 .map_err(|e| e.to_string())
+            }
+            "status" => {
+                if args.len() != 2 {
+                    return Err("status takes no options".into());
+                }
+                Self::run_status()
             }
             "gpu-probe" => {
                 run_gpu_probe();
