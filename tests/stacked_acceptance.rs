@@ -72,8 +72,8 @@ fn fixture(depth: usize) -> PSSALayerV2 {
         patterned(&mut block.mlp_w1.data, 0.075, layer);
         patterned(&mut block.mlp_w2.data, 0.055, layer);
         patterned(&mut block.h_persistent, 0.19, layer);
-        block.memory.insert(&[0.22, -0.14], &[0.62, -0.38, 0.27]);
-        block.memory.insert(&[-0.17, 0.19], &[-0.41, 0.49, -0.31]);
+        block.memory.insert(&[0.22, -0.14], &[1.55, -0.95, 0.68]);
+        block.memory.insert(&[-0.17, 0.19], &[-1.03, 1.23, -0.78]);
         assert_eq!(block.memory.count, 2, "fixture bank must be populated");
     }
     model
