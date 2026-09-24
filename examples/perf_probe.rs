@@ -13,8 +13,13 @@ const INFERENCE_TOKENS_PER_ROUND: usize = 32;
 
 /// Kept exported so `cargo rustc --example perf_probe --release -- --emit=asm`
 /// exposes the code generated for the actual `dot_slice` implementation.
+///
+/// # Safety
+///
+/// `a` and `b` must each point to at least `len` initialized, correctly
+/// aligned `f32` values that stay valid and unaliased for the call.
 #[unsafe(no_mangle)]
-pub extern "C" fn perf_probe_dot_export(a: *const f32, b: *const f32, len: usize) -> f32 {
+pub unsafe extern "C" fn perf_probe_dot_export(a: *const f32, b: *const f32, len: usize) -> f32 {
     // The probe supplies valid pointers. Keeping the call here prevents the dot
     // implementation from becoming an unnamed, fully inlined-only code path in
     // assembly evidence.

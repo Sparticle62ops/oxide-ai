@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
-use tokenizers::models::bpe::{BpeTrainer, BPE};
+use tokenizers::models::bpe::{BPE, BpeTrainer};
 use tokenizers::pre_tokenizers::byte_level::ByteLevel;
 use tokenizers::tokenizer::{NormalizerWrapper, PostProcessorWrapper};
 use tokenizers::{AddedToken, Tokenizer as HfTokenizer, TokenizerBuilder};

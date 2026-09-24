@@ -1,7 +1,7 @@
+use crate::backend::{Device, gemm_cpu_reference};
 use crate::checkpoint::{self, CheckpointFormat};
 use crate::dataset::{DatasetManager, Tokenizer, TokenizerKind};
 use crate::inference::{InferenceConfig, PSSAInferenceEngine};
-use crate::backend::{gemm_cpu_reference, Device};
 use crate::pssa::{PSSAConfigV2, PSSALayerV2};
 use crate::ui;
 use std::collections::{HashMap, HashSet};
@@ -354,16 +354,34 @@ impl CLIHandler {
             ));
         }
         ui::banner("train", "plastic state-space architecture");
-        ui::field("corpus", &format!("{} tokens", ui::thousands(docs.iter().map(Vec::len).sum())));
+        ui::field(
+            "corpus",
+            &format!("{} tokens", ui::thousands(docs.iter().map(Vec::len).sum())),
+        );
         ui::field("vocabulary", &ui::thousands(model.cfg.d_vocab));
-        ui::field("width", &format!("latent {} / state {}", model.cfg.d_latent, model.cfg.d_state));
-        ui::field("memory", &format!("{} slots, key width {}", options.memory, model.cfg.d_mem_key));
-        ui::field("schedule", &format!(
-            "{} epoch(s), {} updates, lr {}",
-            options.epochs,
-            ui::thousands(total_updates),
-            options.lr
-        ));
+        ui::field(
+            "width",
+            &format!(
+                "latent {} / state {}",
+                model.cfg.d_latent, model.cfg.d_state
+            ),
+        );
+        ui::field(
+            "memory",
+            &format!(
+                "{} slots, key width {}",
+                options.memory, model.cfg.d_mem_key
+            ),
+        );
+        ui::field(
+            "schedule",
+            &format!(
+                "{} epoch(s), {} updates, lr {}",
+                options.epochs,
+                ui::thousands(total_updates),
+                options.lr
+            ),
+        );
         println!();
 
         let started = Instant::now();
@@ -439,7 +457,14 @@ impl CLIHandler {
         ui::field("tokens", &ui::thousands(tokens_seen));
         ui::field(
             "throughput",
-            &format!("{:.0} tokens/second", if wall > 0.0 { tokens_seen as f64 / wall } else { 0.0 }),
+            &format!(
+                "{:.0} tokens/second",
+                if wall > 0.0 {
+                    tokens_seen as f64 / wall
+                } else {
+                    0.0
+                }
+            ),
         );
         ui::field("updates", &ui::thousands(update));
         println!();
@@ -707,9 +732,16 @@ impl CLIHandler {
             ("status", "checkpoints and corpora in this directory"),
             ("download", "pull a Hugging Face dataset to a local file"),
             ("benchmark", "end-to-end smoke test on the built-in corpus"),
-            ("gpu-probe", "check whether a WebGPU compute device is usable"),
+            (
+                "gpu-probe",
+                "check whether a WebGPU compute device is usable",
+            ),
         ] {
-            ui::panel_row(&format!("{}{}", ui::cyan(&format!("{name:<12}")), ui::dim(blurb)));
+            ui::panel_row(&format!(
+                "{}{}",
+                ui::cyan(&format!("{name:<12}")),
+                ui::dim(blurb)
+            ));
         }
         ui::panel_bottom();
         println!();
@@ -730,7 +762,9 @@ impl CLIHandler {
         let mut checkpoints: Vec<(String, u64)> = Vec::new();
         let mut corpora: Vec<(String, u64)> = Vec::new();
         for dir in [".", "data", "chain", "data/chain"] {
-            let Ok(entries) = std::fs::read_dir(dir) else { continue };
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                continue;
+            };
             for entry in entries.flatten() {
                 let path = entry.path();
                 let Some(name) = path.to_str() else { continue };
@@ -760,7 +794,10 @@ impl CLIHandler {
                 ui::panel_field(label, &format!("{}  {}", name, ui::dim(&ui::bytes(*size))));
             }
             if checkpoints.len() > shown {
-                ui::panel_field("", &ui::dim(&format!("+{} more", checkpoints.len() - shown)));
+                ui::panel_field(
+                    "",
+                    &ui::dim(&format!("+{} more", checkpoints.len() - shown)),
+                );
             }
         }
         if corpora.is_empty() {
@@ -781,7 +818,9 @@ impl CLIHandler {
         Self::workspace_panel();
         let mut described = 0usize;
         for dir in ["data", "chain", "data/chain", "."] {
-            let Ok(entries) = std::fs::read_dir(dir) else { continue };
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                continue;
+            };
             let mut paths: Vec<String> = entries
                 .flatten()
                 .filter_map(|e| e.path().to_str().map(|s| s.to_string()))
@@ -850,7 +889,10 @@ impl CLIHandler {
             ("chat", "interactive prompt loop against a checkpoint"),
             ("download", "pull a Hugging Face dataset to a local file"),
             ("benchmark", "end-to-end smoke test on the built-in corpus"),
-            ("gpu-probe", "check whether a WebGPU compute device is usable"),
+            (
+                "gpu-probe",
+                "check whether a WebGPU compute device is usable",
+            ),
             ("help", "show this message"),
         ] {
             println!("    {:<12}{}", ui::cyan(name), ui::dim(blurb));
@@ -858,26 +900,78 @@ impl CLIHandler {
         println!();
         println!("  {}", ui::bold("TRAIN"));
         println!("    {bin} train [source] [-d|--data source] [-o|--out path]");
-        println!("    {:<30}{}", "  --tokenizer bpe|word", ui::dim("default bpe"));
-        println!("    {:<30}{}", "  --vocab-size n", ui::dim("byte-level BPE ceiling, default 2048"));
-        println!("    {:<30}{}", "  -e|--epochs n", ui::dim("passes over the selected slice"));
-        println!("    {:<30}{}", "  --latent n --state n", ui::dim("model width and recurrent state size"));
-        println!("    {:<30}{}", "  --key n --memory n", ui::dim("episodic key width and bank capacity"));
-        println!("    {:<30}{}", "  --chunk n --accumulate n", ui::dim("sequence chunk and gradient accumulation"));
-        println!("    {:<30}{}", "  --lr f --warmup-steps n", ui::dim("optimizer schedule"));
-        println!("    {:<30}{}", "  --seed n", ui::dim("deterministic initialisation"));
-        println!("    {:<30}{}", "  --max-tokens n", ui::dim("global cap on training tokens"));
-        println!("    {:<30}{}", "  --skip-tokens n", ui::dim("drop this many tokens from the front first"));
-        println!("    {:<30}{}", "  --resume path", ui::dim("continue from an existing checkpoint"));
+        println!(
+            "    {:<30}{}",
+            "  --tokenizer bpe|word",
+            ui::dim("default bpe")
+        );
+        println!(
+            "    {:<30}{}",
+            "  --vocab-size n",
+            ui::dim("byte-level BPE ceiling, default 2048")
+        );
+        println!(
+            "    {:<30}{}",
+            "  -e|--epochs n",
+            ui::dim("passes over the selected slice")
+        );
+        println!(
+            "    {:<30}{}",
+            "  --latent n --state n",
+            ui::dim("model width and recurrent state size")
+        );
+        println!(
+            "    {:<30}{}",
+            "  --key n --memory n",
+            ui::dim("episodic key width and bank capacity")
+        );
+        println!(
+            "    {:<30}{}",
+            "  --chunk n --accumulate n",
+            ui::dim("sequence chunk and gradient accumulation")
+        );
+        println!(
+            "    {:<30}{}",
+            "  --lr f --warmup-steps n",
+            ui::dim("optimizer schedule")
+        );
+        println!(
+            "    {:<30}{}",
+            "  --seed n",
+            ui::dim("deterministic initialisation")
+        );
+        println!(
+            "    {:<30}{}",
+            "  --max-tokens n",
+            ui::dim("global cap on training tokens")
+        );
+        println!(
+            "    {:<30}{}",
+            "  --skip-tokens n",
+            ui::dim("drop this many tokens from the front first")
+        );
+        println!(
+            "    {:<30}{}",
+            "  --resume path",
+            ui::dim("continue from an existing checkpoint")
+        );
         println!();
         println!("  {}", ui::bold("GENERATE"));
-        println!("    {bin} generate <prompt> [-m|--model path] [-t|--temp f] [--max-new-tokens n]");
+        println!(
+            "    {bin} generate <prompt> [-m|--model path] [-t|--temp f] [--max-new-tokens n]"
+        );
         println!();
         println!("  {}", ui::bold("EXAMPLES"));
-        println!("    {}", ui::dim("# train a fresh checkpoint on the first 200k tokens"));
+        println!(
+            "    {}",
+            ui::dim("# train a fresh checkpoint on the first 200k tokens")
+        );
         println!("    {bin} train data/downloaded.txt -o data/model.pssa --max-tokens 200000 -e 1");
         println!();
-        println!("    {}", ui::dim("# continue that run on the next slice of the same corpus"));
+        println!(
+            "    {}",
+            ui::dim("# continue that run on the next slice of the same corpus")
+        );
         println!("    {bin} train data/downloaded.txt -o data/ck02.pssa \\");
         println!("      --resume data/model.pssa --max-tokens 200000 --skip-tokens 200000 -e 1");
         println!();

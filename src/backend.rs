@@ -253,14 +253,17 @@ impl WgpuContext {
         let usage = if read_only {
             wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST
         } else {
-            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST
+            wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST
         };
 
-        self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some(label),
-            contents: bytemuck::cast_slice(data),
-            usage,
-        })
+        self.device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(label),
+                contents: bytemuck::cast_slice(data),
+                usage,
+            })
     }
 
     pub fn read_buffer_blocking(&self, buffer: &wgpu::Buffer, count: usize) -> Vec<f32> {
@@ -273,9 +276,11 @@ impl WgpuContext {
             mapped_at_creation: false,
         });
 
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("Readback Encoder"),
-        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Readback Encoder"),
+            });
 
         encoder.copy_buffer_to_buffer(buffer, 0, &staging, 0, byte_len);
         self.queue.submit(Some(encoder.finish()));
@@ -327,10 +332,22 @@ impl WgpuContext {
             label: Some("gemm_bind_group"),
             layout: &layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: cfg_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: x_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: w_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: y_buf.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: cfg_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: x_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: w_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: y_buf.as_entire_binding(),
+                },
             ],
         });
 
@@ -412,7 +429,9 @@ impl TensorBuffer {
     pub fn as_cpu_slice(&self) -> &[f32] {
         match self {
             TensorBuffer::Cpu(vec) => vec.as_slice(),
-            TensorBuffer::Gpu(_) => panic!("Attempted to read GPU tensor directly as CPU slice without staging readback."),
+            TensorBuffer::Gpu(_) => panic!(
+                "Attempted to read GPU tensor directly as CPU slice without staging readback."
+            ),
         }
     }
 
@@ -472,7 +491,8 @@ impl ParamTensor {
             TensorBuffer::Gpu(buf) => {
                 if let Device::Gpu(ctx) = &self.device {
                     let zero_vec = vec![0.0f32; self.shape.iter().product()];
-                    ctx.queue.write_buffer(buf, 0, bytemuck::cast_slice(&zero_vec));
+                    ctx.queue
+                        .write_buffer(buf, 0, bytemuck::cast_slice(&zero_vec));
                 }
             }
         }

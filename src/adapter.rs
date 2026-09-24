@@ -1,4 +1,4 @@
-use crate::linalg::{sigmoid, SimpleRng};
+use crate::linalg::{SimpleRng, sigmoid};
 use crate::pssa::ParamMatrix;
 
 #[derive(Clone, Debug, PartialEq)]

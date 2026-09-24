@@ -1,6 +1,6 @@
 use crate::adapter::PlasticAdapterV2;
 use crate::backend::Device;
-use crate::linalg::{dot_slice, sigmoid, softplus, SimpleRng};
+use crate::linalg::{SimpleRng, dot_slice, sigmoid, softplus};
 use crate::memory::HyperbolicEpisodicBankV2;
 use std::f32;
 

@@ -26,13 +26,27 @@ fn paint(code: &str, text: &str) -> String {
     }
 }
 
-pub fn bold(t: &str) -> String { paint("1", t) }
-pub fn dim(t: &str) -> String { paint("2", t) }
-pub fn cyan(t: &str) -> String { paint("36", t) }
-pub fn green(t: &str) -> String { paint("32", t) }
-pub fn yellow(t: &str) -> String { paint("33", t) }
-pub fn red(t: &str) -> String { paint("31", t) }
-pub fn magenta(t: &str) -> String { paint("35", t) }
+pub fn bold(t: &str) -> String {
+    paint("1", t)
+}
+pub fn dim(t: &str) -> String {
+    paint("2", t)
+}
+pub fn cyan(t: &str) -> String {
+    paint("36", t)
+}
+pub fn green(t: &str) -> String {
+    paint("32", t)
+}
+pub fn yellow(t: &str) -> String {
+    paint("33", t)
+}
+pub fn red(t: &str) -> String {
+    paint("31", t)
+}
+pub fn magenta(t: &str) -> String {
+    paint("35", t)
+}
 
 /// Visible width of a string, ignoring ANSI escape sequences.
 pub fn visible_len(s: &str) -> usize {
@@ -245,7 +259,10 @@ impl Step {
     }
 
     pub fn done(self, detail: &str) {
-        let elapsed = dim(&format!("({})", duration(self.started.elapsed().as_secs_f64())));
+        let elapsed = dim(&format!(
+            "({})",
+            duration(self.started.elapsed().as_secs_f64())
+        ));
         let tail = if detail.is_empty() {
             String::new()
         } else {
@@ -298,8 +315,16 @@ impl Progress {
 
         let elapsed = self.started.elapsed().as_secs_f64();
         let fraction = (done as f64 / self.total as f64).clamp(0.0, 1.0);
-        let rate = if elapsed > 0.0 { self.tokens as f64 / elapsed } else { 0.0 };
-        let remaining = if fraction > 0.0 { elapsed / fraction - elapsed } else { f64::NAN };
+        let rate = if elapsed > 0.0 {
+            self.tokens as f64 / elapsed
+        } else {
+            0.0
+        };
+        let remaining = if fraction > 0.0 {
+            elapsed / fraction - elapsed
+        } else {
+            f64::NAN
+        };
 
         if self.interactive {
             let bar_width = (width() as i64 - 52).clamp(16, 40) as usize;

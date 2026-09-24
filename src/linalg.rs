@@ -36,11 +36,15 @@ pub struct Vector {
 
 impl Vector {
     pub fn zeros(len: usize) -> Self {
-        Self { data: vec![0.0; len] }
+        Self {
+            data: vec![0.0; len],
+        }
     }
 
     pub fn from_slice(slice: &[f32]) -> Self {
-        Self { data: slice.to_vec() }
+        Self {
+            data: slice.to_vec(),
+        }
     }
 
     #[inline(always)]
@@ -102,7 +106,12 @@ impl Vector {
     #[inline(always)]
     pub fn add(&self, other: &Vector) -> Vector {
         Vector {
-            data: self.data.iter().zip(&other.data).map(|(a, b)| a + b).collect(),
+            data: self
+                .data
+                .iter()
+                .zip(&other.data)
+                .map(|(a, b)| a + b)
+                .collect(),
         }
     }
 
@@ -111,7 +120,11 @@ impl Vector {
         let n = self.norm();
         if n > max_norm {
             Vector {
-                data: self.data.iter().map(|a| a * (max_norm / (n + 1e-7))).collect(),
+                data: self
+                    .data
+                    .iter()
+                    .map(|a| a * (max_norm / (n + 1e-7)))
+                    .collect(),
             }
         } else {
             self.clone()
@@ -134,19 +147,35 @@ impl Vector {
 /// mixed absolute/relative tolerance rather than bitwise equality.
 #[inline(always)]
 pub fn dot_slice(a: &[f32], b: &[f32]) -> f32 {
-    assert_eq!(a.len(), b.len(), "dot product operands must have equal lengths");
+    assert_eq!(
+        a.len(),
+        b.len(),
+        "dot product operands must have equal lengths"
+    );
 
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma"))]
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx2",
+        target_feature = "fma"
+    ))]
     {
         // SAFETY: the helper only reads within the equally sized input slices.
         return unsafe { dot_slice_avx2_fma(a, b) };
     }
 
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma")))]
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx2",
+        target_feature = "fma"
+    )))]
     dot_slice_portable(a, b)
 }
 
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx2",
+    target_feature = "fma"
+))]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn dot_slice_avx2_fma(a: &[f32], b: &[f32]) -> f32 {
     use std::arch::x86_64::*;
@@ -165,7 +194,11 @@ unsafe fn dot_slice_avx2_fma(a: &[f32], b: &[f32]) -> f32 {
 
     while i + 32 <= len {
         unsafe {
-            acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(a_ptr.add(i)), _mm256_loadu_ps(b_ptr.add(i)), acc0);
+            acc0 = _mm256_fmadd_ps(
+                _mm256_loadu_ps(a_ptr.add(i)),
+                _mm256_loadu_ps(b_ptr.add(i)),
+                acc0,
+            );
             acc1 = _mm256_fmadd_ps(
                 _mm256_loadu_ps(a_ptr.add(i + 8)),
                 _mm256_loadu_ps(b_ptr.add(i + 8)),
@@ -188,7 +221,10 @@ unsafe fn dot_slice_avx2_fma(a: &[f32], b: &[f32]) -> f32 {
     let pair01 = _mm256_add_ps(acc0, acc1);
     let pair23 = _mm256_add_ps(acc2, acc3);
     let lanes = _mm256_add_ps(pair01, pair23);
-    let folded = _mm_add_ps(_mm256_castps256_ps128(lanes), _mm256_extractf128_ps(lanes, 1));
+    let folded = _mm_add_ps(
+        _mm256_castps256_ps128(lanes),
+        _mm256_extractf128_ps(lanes, 1),
+    );
     let pair = _mm_hadd_ps(folded, folded);
     let mut sum = _mm_cvtss_f32(_mm_hadd_ps(pair, pair));
     while i < len {
@@ -198,7 +234,11 @@ unsafe fn dot_slice_avx2_fma(a: &[f32], b: &[f32]) -> f32 {
     sum
 }
 
-#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma")))]
+#[cfg(not(all(
+    target_arch = "x86_64",
+    target_feature = "avx2",
+    target_feature = "fma"
+)))]
 #[inline(always)]
 fn dot_slice_portable(a: &[f32], b: &[f32]) -> f32 {
     let mut i = 0;
@@ -220,8 +260,14 @@ fn dot_slice_portable(a: &[f32], b: &[f32]) -> f32 {
 
 #[inline(always)]
 pub unsafe fn dot_256_raw(a: *const f32, b: *const f32) -> f32 {
-    let mut s0 = 0.0f32; let mut s1 = 0.0f32; let mut s2 = 0.0f32; let mut s3 = 0.0f32;
-    let mut s4 = 0.0f32; let mut s5 = 0.0f32; let mut s6 = 0.0f32; let mut s7 = 0.0f32;
+    let mut s0 = 0.0f32;
+    let mut s1 = 0.0f32;
+    let mut s2 = 0.0f32;
+    let mut s3 = 0.0f32;
+    let mut s4 = 0.0f32;
+    let mut s5 = 0.0f32;
+    let mut s6 = 0.0f32;
+    let mut s7 = 0.0f32;
     unsafe {
         for i in (0..256).step_by(8) {
             s0 += *a.add(i) * *b.add(i);
@@ -239,8 +285,14 @@ pub unsafe fn dot_256_raw(a: *const f32, b: *const f32) -> f32 {
 
 #[inline(always)]
 pub unsafe fn dot_128_raw(a: *const f32, b: *const f32) -> f32 {
-    let mut s0 = 0.0f32; let mut s1 = 0.0f32; let mut s2 = 0.0f32; let mut s3 = 0.0f32;
-    let mut s4 = 0.0f32; let mut s5 = 0.0f32; let mut s6 = 0.0f32; let mut s7 = 0.0f32;
+    let mut s0 = 0.0f32;
+    let mut s1 = 0.0f32;
+    let mut s2 = 0.0f32;
+    let mut s3 = 0.0f32;
+    let mut s4 = 0.0f32;
+    let mut s5 = 0.0f32;
+    let mut s6 = 0.0f32;
+    let mut s7 = 0.0f32;
     unsafe {
         for i in (0..128).step_by(8) {
             s0 += *a.add(i) * *b.add(i);
@@ -258,7 +310,10 @@ pub unsafe fn dot_128_raw(a: *const f32, b: *const f32) -> f32 {
 
 #[inline(always)]
 pub unsafe fn dot_32_raw(a: *const f32, b: *const f32) -> f32 {
-    let mut s0 = 0.0f32; let mut s1 = 0.0f32; let mut s2 = 0.0f32; let mut s3 = 0.0f32;
+    let mut s0 = 0.0f32;
+    let mut s1 = 0.0f32;
+    let mut s2 = 0.0f32;
+    let mut s3 = 0.0f32;
     unsafe {
         for i in (0..32).step_by(4) {
             s0 += *a.add(i) * *b.add(i);
@@ -279,12 +334,18 @@ pub struct Matrix {
 
 impl Matrix {
     pub fn zeros(rows: usize, cols: usize) -> Self {
-        Self { rows, cols, data: vec![0.0; rows * cols] }
+        Self {
+            rows,
+            cols,
+            data: vec![0.0; rows * cols],
+        }
     }
 
     pub fn random_xavier(rows: usize, cols: usize, rng: &mut SimpleRng) -> Self {
         let limit = (6.0 / (rows + cols) as f32).sqrt();
-        let data = (0..rows * cols).map(|_| rng.gen_range_f32(-limit, limit)).collect();
+        let data = (0..rows * cols)
+            .map(|_| rng.gen_range_f32(-limit, limit))
+            .collect();
         Self { rows, cols, data }
     }
 
@@ -366,7 +427,9 @@ impl Matrix {
 
     #[inline(always)]
     pub fn get_row(&self, row: usize) -> Vector {
-        Vector { data: self.get_row_slice(row).to_vec() }
+        Vector {
+            data: self.get_row_slice(row).to_vec(),
+        }
     }
 
     pub fn invert(&self) -> Result<Matrix, String> {
