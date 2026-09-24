@@ -91,6 +91,18 @@ esac
 echo
 echo "### 3. Continue the chain"
 mkdir -p "$WORK/chain"
+# A new Kaggle session starts with an empty /kaggle/working, so checkpoints from a
+# previous saved version arrive under /kaggle/input instead. Copy them back in so
+# the chain resumes instead of silently restarting at ck01.
+if ! ls "$WORK/chain"/ck*.pssa >/dev/null 2>&1; then
+  SEED="$(ls -1 /kaggle/input/*/chain/ck*.pssa /kaggle/input/*/ck*.pssa 2>/dev/null | sort | tail -1 || true)"
+  if [ -n "$SEED" ]; then
+    echo "seeding chain from $(dirname "$SEED")"
+    cp "$(dirname "$SEED")"/ck*.pssa "$WORK/chain"/
+  else
+    echo "no earlier checkpoints found in /kaggle/input, this will start a fresh chain"
+  fi
+fi
 PREV=""
 START=1
 for i in $(seq 1 "$TOTAL"); do
