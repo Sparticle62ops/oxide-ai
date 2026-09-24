@@ -7,7 +7,7 @@ set -euo pipefail
 REPO="${REPO:-https://github.com/Sparticle62ops/oxide-ai.git}"
 WORK="${WORK:-/kaggle/working}"
 BRANCH="${BRANCH:-main}"
-TOTAL="${TOTAL:-8}"
+TOTAL="${TOTAL:-16}"
 # Each link reads a different WINDOW-sized slice instead of the same prefix, so the
 # chain walks the whole corpus. The offset wraps around at the end of the file.
 WINDOW="${WINDOW:-200000}"
